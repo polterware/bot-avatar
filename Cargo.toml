@@ -1,0 +1,14 @@
+[package]
+name = "bot-avatar"
+version = "0.1.0"
+edition = "2024"
+description = "The Polterware bot avatars, drawn with tiny-skia."
+license = "Apache-2.0"
+repository = "https://github.com/polterware/bot-avatar"
+
+[dependencies]
+tiny-skia = { version = "0.11", features = ["png-format"] }
+
+[profile.profiling]
+inherits = "release"
+debug = true

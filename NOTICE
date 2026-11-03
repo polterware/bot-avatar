@@ -1,0 +1,7 @@
+bot-avatar
+Copyright 2026 Erick Barcelos
+
+Licensed under the Apache License, Version 2.0 (LICENSE).
+
+This crate is a Rust port of bot-avatars, the TypeScript bot avatar renderer by
+Jakub Antalik, used under the MIT License (LICENSE-bot-avatars).
