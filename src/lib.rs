@@ -25,7 +25,7 @@ pub use avatar::{Avatar, MascotMood, kind_for_agent, state_for_status};
 pub use engine::Calm;
 pub use expression::Expression;
 pub use glyph::Glyph;
-pub use poke::Poke;
+pub use poke::{Poke, spin_time_at, spin_yaw};
 pub use stage::Look;
 
 #[cfg(test)]

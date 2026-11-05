@@ -120,6 +120,36 @@ pub struct Pokes {
 }
 
 const SPIN_EASE: Bezier = Bezier::new(0.5, -0.22, 0.3, 1.0);
+
+/// How far a [`Poke::Spin`] of `turns` has turned the bot, in degrees, `t` seconds after it
+/// started: 0 before, `360 × turns` once it is over. Two bots spun at the same moment turn
+/// alike, so one can hand over to the other while both face sideways.
+pub fn spin_yaw(t: f64, turns: u32) -> f64 {
+    let turns = turns.max(1);
+    let u = (t / Poke::Spin.duration(turns)).clamp(0.0, 1.0);
+    360.0 * f64::from(turns) * SPIN_EASE.at(u)
+}
+
+/// When a [`Poke::Spin`] of `turns` has turned the bot `degrees`, in seconds after it
+/// started, for `degrees` above zero.
+pub fn spin_time_at(degrees: f64, turns: u32) -> f64 {
+    let duration = Poke::Spin.duration(turns.max(1));
+    let (mut lo, mut hi) = (0.0_f64, duration);
+    if spin_yaw(hi, turns) < degrees {
+        return duration;
+    }
+    // The wind-up only turns back below zero, so the yaw is under any positive target
+    // until it crosses it once.
+    for _ in 0..48 {
+        let mid = 0.5 * (lo + hi);
+        if spin_yaw(mid, turns) < degrees {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    hi
+}
 const FLIP_EASE: Bezier = Bezier::new(0.45, -0.2, 0.35, 1.0);
 
 impl Pokes {
@@ -152,7 +182,7 @@ impl Pokes {
             let u = (r.t / r.poke.duration(r.turns)).clamp(0.0, 1.0);
             match r.poke {
                 Poke::Spin => {
-                    o.yaw += 360.0 * f64::from(r.turns) * SPIN_EASE.at(u);
+                    o.yaw += spin_yaw(r.t, r.turns);
                     let hop = bump(u, 0.08, 0.7);
                     o.y -= 7.0 * hop;
                     o.sx *= 1.0 - 0.03 * hop;
@@ -205,7 +235,23 @@ impl Pokes {
 
 #[cfg(test)]
 mod tests {
-    use super::{Poke, PokeOffset, Pokes};
+    use super::{Poke, PokeOffset, Pokes, spin_time_at, spin_yaw};
+
+    #[test]
+    fn a_spin_reaches_a_turn_at_the_time_it_says() {
+        for turns in [1, 2] {
+            let full = 360.0 * f64::from(turns);
+            assert_eq!(spin_yaw(0.0, turns), 0.0);
+            assert!((spin_yaw(Poke::Spin.duration(turns), turns) - full).abs() < 1e-9);
+            for degrees in [90.0, 270.0, full - 90.0] {
+                let at = spin_time_at(degrees, turns);
+                assert!(
+                    (spin_yaw(at, turns) - degrees).abs() < 0.01,
+                    "{degrees} at {at}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn a_spin_turns_once_and_ends_at_rest() {

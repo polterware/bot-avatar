@@ -52,6 +52,8 @@ pub enum MascotMood {
     Sad,
     /// Awake and looking all around, as a search that matched nothing.
     Lost,
+    /// Awake and at ease, standing in for an agent not picked yet (Dispatch's Auto).
+    Awake,
 }
 
 /// How the rig idles between poses.
@@ -120,7 +122,7 @@ impl Avatar {
     pub fn mascot(mood: MascotMood, size_px: u32, scale: f32) -> Self {
         let state = match mood {
             MascotMood::Sleeping => BotAvatarState::Sleeping,
-            MascotMood::Sad | MascotMood::Lost => BotAvatarState::Default,
+            MascotMood::Sad | MascotMood::Lost | MascotMood::Awake => BotAvatarState::Default,
         };
         let turn = if mood == MascotMood::Lost { 1.0 } else { 0.35 };
         let mut avatar = Self::build(
