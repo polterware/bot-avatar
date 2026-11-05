@@ -9,7 +9,8 @@
 //! `kind_for_agent` and `state_for_status` follow
 //! `packages/features/dispatch/src/agent-avatar.tsx` (9–32): a trimmed id, or
 //! `"agent"` when empty; the mark's body when one matches, otherwise the hash;
-//! pending/running work, failed/cancelled/timed_out sleep, anything else idle.
+//! the run statuses as [`dispatch_bot_state`](crate::agent_marks::dispatch_bot_state) maps
+//! them, anything else idle.
 //! [`Avatar::for_agent`] also takes that component's motion: a bot whose run is not working
 //! makes no idle jumps and turns its head 0.35 as far.
 //!
@@ -519,13 +520,16 @@ pub fn kind_for_agent(agent_id: &str) -> BotAvatarType {
 /// A run status maps the way Dispatch does; any other word is a state's name, and an unknown
 /// word is idle.
 fn agent_state(status: &str) -> BotAvatarState {
-    const RUN_STATUSES: [&str; 6] = [
+    const RUN_STATUSES: [&str; 9] = [
         "pending",
         "running",
+        "completed",
+        "succeeded",
         "failed",
         "cancelled",
         "canceled",
         "timed_out",
+        "orphaned",
     ];
     let lower = status.trim().to_ascii_lowercase();
     if RUN_STATUSES.contains(&lower.as_str()) {
@@ -798,14 +802,16 @@ mod tests {
 
     #[test]
     fn state_for_status_matches_dispatch() {
-        assert_eq!(state_for_status("pending"), BotAvatarState::Working);
+        assert_eq!(state_for_status("PENDING"), BotAvatarState::Listening);
         assert_eq!(state_for_status("running"), BotAvatarState::Working);
-        assert_eq!(state_for_status("Running"), BotAvatarState::Working);
-        assert_eq!(state_for_status("failed"), BotAvatarState::Sleeping);
-        assert_eq!(state_for_status("cancelled"), BotAvatarState::Sleeping);
-        assert_eq!(state_for_status("canceled"), BotAvatarState::Sleeping);
-        assert_eq!(state_for_status("timed_out"), BotAvatarState::Sleeping);
-        assert_eq!(state_for_status("succeeded"), BotAvatarState::Default);
+        assert_eq!(state_for_status("RUNNING"), BotAvatarState::Working);
+        assert_eq!(state_for_status("COMPLETED"), BotAvatarState::Finished);
+        assert_eq!(state_for_status("succeeded"), BotAvatarState::Finished);
+        assert_eq!(state_for_status("FAILED"), BotAvatarState::Sad);
+        assert_eq!(state_for_status("TIMED_OUT"), BotAvatarState::Drowsy);
+        assert_eq!(state_for_status("CANCELLED"), BotAvatarState::Bored);
+        assert_eq!(state_for_status("canceled"), BotAvatarState::Bored);
+        assert_eq!(state_for_status("ORPHANED"), BotAvatarState::Confused);
         assert_eq!(state_for_status(" "), BotAvatarState::Default);
         assert_eq!(state_for_status("blocked"), BotAvatarState::Default);
         assert_eq!(state_for_status("idle"), BotAvatarState::Default);
@@ -901,7 +907,7 @@ mod tests {
         assert_eq!(cursor.state, BotAvatarState::Default);
         let grok = Avatar::for_agent("grok", "failed", 28, 1.0);
         assert_eq!(grok.kind, BotAvatarType::Hexagon);
-        assert_eq!(grok.state, BotAvatarState::Sleeping);
+        assert_eq!(grok.state, BotAvatarState::Sad);
     }
 
     #[test]

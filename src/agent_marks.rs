@@ -268,14 +268,24 @@ pub fn seed_for(id: &str) -> f64 {
     ((hash32(id) % 1000) as f64) / 1000.0
 }
 
-/// Map a Dispatch run status string to a [`BotAvatarState`] (`agent-avatar.tsx`).
+/// Map a Dispatch run status string to a [`BotAvatarState`], in any case.
+///
+/// Every state here keeps the agent's own body facing the viewer, so a run's bot still says
+/// which agent it is: a queued run listens, a running one works, a finished one smiles, a
+/// failed one is sad, one that ran out of time is drowsy, a cancelled one is bored, and one
+/// whose runner is gone is confused. Anything else is idle.
 pub fn dispatch_bot_state(status: Option<&str>) -> BotAvatarState {
     let Some(s) = status else {
         return BotAvatarState::Default;
     };
-    match s.to_ascii_lowercase().as_str() {
-        "pending" | "running" => BotAvatarState::Working,
-        "failed" | "cancelled" | "canceled" | "timed_out" => BotAvatarState::Sleeping,
+    match s.trim().to_ascii_lowercase().as_str() {
+        "pending" => BotAvatarState::Listening,
+        "running" => BotAvatarState::Working,
+        "completed" | "succeeded" => BotAvatarState::Finished,
+        "failed" => BotAvatarState::Sad,
+        "timed_out" => BotAvatarState::Drowsy,
+        "cancelled" | "canceled" => BotAvatarState::Bored,
+        "orphaned" => BotAvatarState::Confused,
         _ => BotAvatarState::Default,
     }
 }
