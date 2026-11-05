@@ -621,23 +621,25 @@ mod tests {
     }
 
     #[test]
-    fn a_busy_bot_reads_and_breathes_without_hopping() {
+    fn a_busy_bot_glances_smiles_and_blinks_with_at_most_a_low_hop() {
         let rest = crate::engine::rest_pose(BotAvatarState::Working);
         let mut bot = Avatar::for_agent("codex", "running", 28, 1.0);
         bot.set_calm(crate::engine::Calm::Busy);
-        let mut looks = Vec::new();
-        for i in 1..=40 {
-            bot.advance(f64::from(i) * 0.1);
+        let (mut glanced, mut smiled, mut blinked) = (false, false, false);
+        for i in 1..=400 {
+            bot.advance(f64::from(i) * 0.05);
             let pose = bot.sim.pose;
-            assert_eq!(
-                (pose.yaw, pose.pitch, pose.y),
-                (rest.yaw, rest.pitch, rest.y)
+            // No turn or nod; a hop is short and low.
+            assert_eq!((pose.yaw, pose.pitch), (rest.yaw, rest.pitch));
+            assert!(
+                (pose.y - rest.y).abs() <= 3.0 + 1e-9,
+                "hop height {}",
+                pose.y
             );
-            looks.push(pose.look_x);
+            glanced |= (pose.look_x - rest.look_x).abs() > 1.5;
+            smiled |= pose.laugh > 0.8;
+            blinked |= pose.blink_l > 0.8;
         }
-        let (low, high) = looks
-            .iter()
-            .fold((f64::MAX, f64::MIN), |(lo, hi), &x| (lo.min(x), hi.max(x)));
-        assert!(high - low > 4.0, "the eyes sweep: {low}..{high}");
+        assert!(glanced && smiled && blinked, "{glanced} {smiled} {blinked}");
     }
 }

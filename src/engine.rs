@@ -371,15 +371,40 @@ pub enum Calm {
     Full,
     /// Only the eyes move, toward the pointer when there is one.
     Gaze,
-    /// At work: the eyes read along a line and flick back, the body breathes, and the bot
-    /// blinks. A pointer takes the eyes over.
+    /// At work: the face plays [`Beat`]s one after another (glances around, happy closed
+    /// eyes, a double blink, a little head tilt, a rare short hop, a rest), while the body breathes and the bot blinks now and then.
+    /// A pointer takes the eyes over.
     Busy,
 }
 
-/// Seconds of one read along a line and back in [`Calm::Busy`].
-const SCAN_SECONDS: f64 = 2.4;
-/// Share of a read spent sweeping left to right; the rest flicks back.
-const SCAN_SWEEP: f64 = 0.82;
+/// One beat of a working bot's face in [`Calm::Busy`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Beat {
+    /// The eyes look to (x, y) and hold there.
+    Glance(f64, f64),
+    /// The eyes close into happy arcs (`laugh`), then open.
+    Happy,
+    /// Two quick blinks, eyes ahead.
+    Blinks,
+    /// The head tilts a little to one side (-1 or 1), the eyes with it, as if curious.
+    Tilt(f64),
+    /// A short low hop, with a little stretch, at most once every `HOP_GAP` seconds.
+    Hop,
+    /// Eyes ahead.
+    Rest,
+}
+
+/// A busy bot's hop: its height in rig units (up is negative y), its length, and the least
+/// time between two hops, so it stays rare.
+const HOP_HEIGHT: f64 = 3.0;
+const HOP_SECONDS: f64 = 0.4;
+const HOP_GAP: f64 = 12.0;
+
+impl Beat {
+    fn same_kind(self, other: Beat) -> bool {
+        std::mem::discriminant(&self) == std::mem::discriminant(&other)
+    }
+}
 
 /// Rig simulator advancing a [`Pose`] through time.
 #[derive(Debug, Clone)]
@@ -427,7 +452,17 @@ pub struct Sim {
     ptr_x: f64,
     ptr_y: f64,
     calm: Calm,
-    scan_phase: f64,
+    beat: Beat,
+    /// When the current beat ends.
+    beat_end: f64,
+    /// When the second blink of `Beat::Blinks` is due.
+    blink_again_at: Option<f64>,
+    /// The eyes and the happy arcs as the busy face eases them.
+    busy_look: (f64, f64),
+    busy_laugh: f64,
+    busy_roll: f64,
+    /// When the last hop began.
+    hop_at: f64,
     ptr_s: f64,
     ptr_target_x: f64,
     ptr_target_y: f64,
@@ -520,7 +555,13 @@ impl Sim {
             ptr_x: 0.0,
             ptr_y: 0.0,
             calm: Calm::Full,
-            scan_phase: 0.0,
+            beat: Beat::Rest,
+            beat_end: 0.0,
+            blink_again_at: None,
+            busy_look: (0.0, 0.0),
+            busy_laugh: 0.0,
+            busy_roll: 0.0,
+            hop_at: f64::NEG_INFINITY,
             ptr_s: 0.0,
             ptr_target_x: 0.0,
             ptr_target_y: 0.0,
@@ -596,15 +637,31 @@ impl Sim {
         let ps = self.ptr_s;
         let mut pose = rest_pose(self.state);
         if self.calm == Calm::Busy {
-            self.scan_phase = (self.scan_phase + dt / SCAN_SECONDS).fract();
-            let q = self.scan_phase;
-            let along = if q < SCAN_SWEEP {
-                ease_in_out(q / SCAN_SWEEP)
-            } else {
-                1.0 - ease_in_out((q - SCAN_SWEEP) / (1.0 - SCAN_SWEEP))
+            if t >= self.beat_end {
+                self.next_beat(t);
+            }
+            let (look, laugh, roll) = match self.beat {
+                Beat::Glance(x, y) => ((x, y), 0.0, 0.0),
+                Beat::Happy => ((0.0, 0.0), 1.0, 0.0),
+                Beat::Tilt(side) => ((2.0 * side, -0.5), 0.0, 5.0 * DEG * side),
+                Beat::Hop => ((0.0, -1.0), 0.0, 0.0),
+                Beat::Blinks | Beat::Rest => ((0.0, 0.0), 0.0, 0.0),
             };
-            pose.look_x += (along * 2.0 - 1.0) * 3.0 * (1.0 - ps);
-            pose.look_y += 1.2 * (1.0 - ps);
+            let (x, y) = self.busy_look;
+            self.busy_look = (approach(x, look.0, 9.0, dt), approach(y, look.1, 9.0, dt));
+            self.busy_laugh = approach(self.busy_laugh, laugh, 10.0, dt);
+            self.busy_roll = approach(self.busy_roll, roll, 6.0, dt);
+            pose.look_x += self.busy_look.0 * (1.0 - ps);
+            pose.look_y += self.busy_look.1 * (1.0 - ps);
+            pose.laugh = self.busy_laugh;
+            pose.roll += self.busy_roll;
+            let q = (t - self.hop_at) / HOP_SECONDS;
+            if (0.0..1.0).contains(&q) {
+                let arc = (PI * q).sin();
+                pose.y -= HOP_HEIGHT * arc;
+                pose.sx *= 1.0 - 0.025 * arc;
+                pose.sy *= 1.0 + 0.04 * arc;
+            }
 
             self.breath_phase += dt / 3.6;
             let breath = (self.breath_phase * TAU).sin();
@@ -612,9 +669,15 @@ impl Sim {
             pose.sx += breath * 0.008;
             pose.sy += breath * 0.012;
 
-            if t >= self.blink_at && !self.blink.active() {
+            // Blinks now and then, and the second of a double blink; none while happy.
+            let due = t >= self.blink_at || self.blink_again_at.is_some_and(|at| t >= at);
+            if due && !self.blink.active() && self.beat != Beat::Happy {
                 self.blink.fire();
-                self.blink_at = t + 2.2 + self.rand.next() * 2.6;
+                if self.blink_again_at.is_some_and(|at| t >= at) {
+                    self.blink_again_at = None;
+                } else {
+                    self.blink_at = t + 2.2 + self.rand.next() * 2.6;
+                }
             }
             self.blink.update(dt);
             if self.blink.active() {
@@ -626,6 +689,59 @@ impl Sim {
         pose.look_x += 4.5 * self.ptr_x * ps;
         pose.look_y += 3.0 * self.ptr_y * ps;
         self.pose = pose;
+    }
+
+    /// Picks the busy face's next beat at `t`: never the same kind twice in a row, and a
+    /// glance looks to the other side from the last one.
+    fn next_beat(&mut self, t: f64) {
+        let last = self.beat;
+        let next = loop {
+            let p = self.rand.next();
+            let beat = if p < 0.45 {
+                let side = match last {
+                    Beat::Glance(x, _) if x > 0.0 => -1.0,
+                    Beat::Glance(..) => 1.0,
+                    _ if self.rand.next() < 0.5 => -1.0,
+                    _ => 1.0,
+                };
+                let x = side * (2.0 + self.rand.next() * 2.0);
+                let y = (self.rand.next() * 2.0 - 1.0) * 1.5;
+                Beat::Glance(x, y)
+            } else if p < 0.66 {
+                Beat::Happy
+            } else if p < 0.76 {
+                Beat::Blinks
+            } else if p < 0.86 {
+                Beat::Tilt(if self.rand.next() < 0.5 { -1.0 } else { 1.0 })
+            } else if p < 0.93 {
+                if t - self.hop_at < HOP_GAP {
+                    continue;
+                }
+                Beat::Hop
+            } else {
+                Beat::Rest
+            };
+            if !beat.same_kind(last) || matches!(beat, Beat::Glance(..)) {
+                break beat;
+            }
+        };
+        let length = match next {
+            Beat::Glance(..) => 0.9 + self.rand.next() * 0.7,
+            Beat::Happy => 1.0 + self.rand.next() * 0.6,
+            Beat::Blinks => 0.8,
+            Beat::Tilt(_) => 1.2 + self.rand.next() * 0.6,
+            Beat::Hop => HOP_SECONDS + 0.3,
+            Beat::Rest => 0.6 + self.rand.next() * 0.6,
+        };
+        if next == Beat::Hop {
+            self.hop_at = t;
+        }
+        if next == Beat::Blinks {
+            self.blink_at = t;
+            self.blink_again_at = Some(t + 0.28);
+        }
+        self.beat = next;
+        self.beat_end = t + length;
     }
 
     pub fn set_pointer(&mut self, x: f64, y: f64, strength: f64) {
