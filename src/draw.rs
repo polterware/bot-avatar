@@ -137,6 +137,8 @@ pub struct DrawConfig {
     pub sides: SideMode,
     pub whirl: Option<WhirlKnobs>,
     pub wear: Option<Wear>,
+    /// Draws the body alone, with no face: a glyph's pieces are made of it.
+    pub faceless: bool,
 }
 
 /// Numbers shared by the fabric and the other materials (`LIGHT_DEFAULTS`, 268–271).
@@ -947,7 +949,7 @@ pub fn draw(ctx: &mut Canvas2D, box_px: f64, pose: &Pose, cfg: &DrawConfig) {
         None
     };
 
-    if facing > -0.2 {
+    if facing > -0.2 && !cfg.faceless {
         ctx.save();
         {
             let (ca, cb, cc, cd, ce, cf) = (body[0], body[1], body[2], body[3], body[4], body[5]);
@@ -1284,6 +1286,7 @@ fn solid_cfg(
         sides: cfg.sides,
         whirl: cfg.whirl,
         wear: cfg.wear.clone(),
+        faceless: cfg.faceless,
     }
 }
 
@@ -1899,6 +1902,7 @@ mod tests {
             sides: SideMode::Vector,
             whirl: None,
             wear: None,
+            faceless: false,
         }
     }
 

@@ -17,6 +17,8 @@
 //! `PolterMascot`, the ghost with the stock fur, asleep, sad (the mouth face), or lost (a full
 //! turn), never jumping.
 
+use std::sync::Arc;
+
 use tiny_skia::Pixmap;
 
 use crate::agent_marks::{agent_mark_for, bot_type_for, dispatch_bot_state, seed_for};
@@ -25,7 +27,7 @@ use crate::color::{auto_ink, richer, shade};
 use crate::draw::{DrawConfig, LIGHT_DEFAULTS, OVERSCAN, OutlineParts, RISE, WhirlKnobs, draw};
 use crate::engine::{Calm, JUMP_DEFAULTS, Pose, Sim};
 use crate::expression::Expression;
-use crate::glyph::{GlyphPaint, draw_glyph};
+use crate::glyph::{GlyphPaint, Part, Sprite, draw_glyph};
 use crate::plastic::FurStyle;
 use crate::poke::Poke;
 use crate::presets::bot_avatar_preset;
@@ -322,9 +324,15 @@ impl Avatar {
             self.canvas.clear_rect(0.0, 0.0, full, full);
         }
         if glyph.amount > 0.0 {
-            let paint = self
+            let mut paint = self
                 .glyph_paint
-                .get_or_insert_with(|| GlyphPaint::new(&cfg.color, &cfg.ink));
+                .take()
+                .unwrap_or_else(|| GlyphPaint::new(&cfg.color, &cfg.ink));
+            let res = (self.size_px, self.scale.to_bits());
+            for part in paint.missing(res, &[glyph.glyph, glyph.outgoing]) {
+                let sprite = bake_part(self.build_config(), part, self.size_px, self.scale);
+                paint.put(part, sprite);
+            }
             let full = box_px * OVERSCAN;
             draw_glyph(
                 &mut self.canvas,
@@ -332,8 +340,9 @@ impl Avatar {
                 full / 2.0 + RISE * box_px,
                 box_px,
                 &glyph,
-                paint,
+                &paint,
             );
+            self.glyph_paint = Some(paint);
         }
         &self.canvas.pixmap
     }
@@ -436,6 +445,7 @@ impl Avatar {
                 color: "#27272b".to_string(),
                 fabric: true,
             }),
+            faceless: false,
         }
     }
 }
@@ -543,6 +553,137 @@ fn step_count(time_seconds: f64) -> u64 {
     capped.floor() as u64
 }
 
+/// How bright a hollow glyph piece is brought up to, against the body colour: about as bright
+/// as the shaded balls beside it.
+const HOLLOW_TONE: f64 = 0.8;
+/// The most a hollow glyph piece is brightened.
+const HOLLOW_LIFT_MAX: f64 = 2.5;
+/// How dense a hollow glyph piece's fur grows, against the body's: on a piece this thin,
+/// stock fur is more fringe than body.
+const HOLLOW_DENSITY: f64 = 0.4;
+
+/// Bakes a glyph's piece in the body's own material: drawn by [`draw`] as the body would be,
+/// facing the viewer, with no face, no wear and no parts, then cut to what it covers.
+fn bake_part(mut cfg: DrawConfig, part: Part, size_px: u32, scale: f32) -> Option<Sprite> {
+    // Glyph units are centred on the body; the body's outline spans 0..100.
+    let path = part
+        .path()?
+        .transform(tiny_skia::Transform::from_translate(50.0, 50.0))?;
+    cfg.path = Arc::new(path);
+    // Its own key, so the piece's form and fur never stand in for the body's.
+    cfg.type_key = Some(format!("glyph-{}", part.key()));
+    cfg.parts = None;
+    cfg.parts_colors = None;
+    cfg.wear = None;
+    cfg.whirl = None;
+    cfg.faceless = true;
+    let (fur, round) = part.look();
+    let sparse = if part.hollow() { HOLLOW_DENSITY } else { 1.0 };
+    cfg.fur = cfg.fur.map(|f| FurStyle {
+        length: quantize_fur(f.length * fur, 0.3, 2.5),
+        density: quantize_fur(f.density * sparse, 0.3, 2.0),
+        ..f
+    });
+    cfg.roundness = Some(round);
+    cfg.still = true;
+    cfg.fur_on_idle = false;
+    let box_px = f64::from(size_px);
+    let k = finite_scale(scale);
+    let side = device_side(size_px, scale);
+    let mut canvas = Canvas2D::new(side, side);
+    canvas.set_transform(k, 0.0, 0.0, k, 0.0, 0.0);
+    let pose = Pose {
+        yaw: 0.0,
+        pitch: 0.0,
+        roll: 0.0,
+        x: 0.0,
+        y: 0.0,
+        sx: 1.0,
+        sy: 1.0,
+        ..Pose::default()
+    };
+    draw(&mut canvas, box_px, &pose, &cfg);
+    crate::plastic_cap::forget_states(&canvas);
+    let pm = &canvas.pixmap;
+    let (w, h) = (pm.width() as usize, pm.height() as usize);
+    let data = pm.data();
+    let (mut x0, mut y0, mut x1, mut y1) = (usize::MAX, usize::MAX, 0, 0);
+    for y in 0..h {
+        for x in 0..w {
+            if data[(y * w + x) * 4 + 3] != 0 {
+                x0 = x0.min(x);
+                y0 = y0.min(y);
+                x1 = x1.max(x + 1);
+                y1 = y1.max(y + 1);
+            }
+        }
+    }
+    if x0 >= x1 || y0 >= y1 {
+        return None;
+    }
+    let mut cut = Pixmap::new((x1 - x0) as u32, (y1 - y0) as u32)?;
+    let row = (x1 - x0) * 4;
+    for (i, y) in (y0..y1).enumerate() {
+        let from = (y * w + x0) * 4;
+        cut.data_mut()[i * row..(i + 1) * row].copy_from_slice(&data[from..from + row]);
+    }
+    if part.hollow() {
+        lift_to(&mut cut, &cfg.color);
+    }
+    // Device pixels per glyph unit, and the glyph origin in device pixels.
+    let unit = box_px / 100.0 * k;
+    let full = box_px * OVERSCAN;
+    let (ox, oy) = (full / 2.0 * k, (full / 2.0 + RISE * box_px) * k);
+    Some(Sprite {
+        pixmap: cut,
+        rect: [
+            (x0 as f64 - ox) / unit,
+            (y0 as f64 - oy) / unit,
+            (x1 - x0) as f64 / unit,
+            (y1 - y0) as f64 / unit,
+        ],
+    })
+}
+
+/// Brightens `pixmap` until its opaque pixels average [`HOLLOW_TONE`] of `color`, channel by
+/// channel, never darker and at most [`HOLLOW_LIFT_MAX`] times, so the shading keeps its
+/// contrast. The fur fringe lifts less the thinner it is, or it glows.
+fn lift_to(pixmap: &mut Pixmap, color: &str) {
+    let Some(target) = crate::color::parse_color(color) else {
+        return;
+    };
+    let (mut sum, mut count) = ([0.0f64; 3], 0.0f64);
+    for px in pixmap.data().chunks_exact(4) {
+        if px[3] == 255 {
+            for c in 0..3 {
+                sum[c] += f64::from(px[c]);
+            }
+            count += 1.0;
+        }
+    }
+    if count == 0.0 {
+        return;
+    }
+    let gain: [u32; 3] = std::array::from_fn(|c| {
+        let mean = sum[c] / count;
+        let k = if mean > 0.0 {
+            HOLLOW_TONE * target[c] / mean
+        } else {
+            1.0
+        };
+        (k.clamp(1.0, HOLLOW_LIFT_MAX) * 256.0).round() as u32
+    });
+    for px in pixmap.data_mut().chunks_exact_mut(4) {
+        let a = u32::from(px[3]);
+        let cover = a * a;
+        for c in 0..3 {
+            // 256 plus the extra gain, scaled by alpha squared.
+            let g = 256 + ((gain[c] - 256) * cover) / (255 * 255);
+            px[c] = ((u32::from(px[c]) * g) >> 8).min(a) as u8;
+        }
+    }
+}
+
 fn device_side(size_px: u32, scale: f32) -> u32 {
     let n = (f64::from(size_px) * OVERSCAN * finite_scale(scale)).round();
     if n.is_finite() && n >= 1.0 {
@@ -626,10 +767,13 @@ fn same_pose(a: &Pose, b: &Pose) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Avatar, MascotMood, kind_for_agent, same_pose, state_for_status, stock_fur};
+    use super::{
+        Avatar, MascotMood, bake_part, kind_for_agent, same_pose, state_for_status, stock_fur,
+    };
     use crate::agent_marks::{agent_mark_for, bot_type_for, seed_for};
     use crate::draw::OutlineParts;
     use crate::engine::JUMP_DEFAULTS;
+    use crate::glyph::Part;
     use crate::plastic::FUR_STOCK;
     use crate::types::{
         BotAvatarFace, BotAvatarShading, BotAvatarState, BotAvatarTheme, BotAvatarType,
@@ -670,6 +814,36 @@ mod tests {
     #[test]
     fn stock_fur_is_on_the_quantized_grid() {
         assert_eq!(stock_fur(), FUR_STOCK);
+    }
+
+    #[test]
+    fn a_glyph_is_laid_from_pieces_baked_in_the_body() {
+        let mut avatar = Avatar::new(BotAvatarType::Blob, BotAvatarState::Progress, 64, 2.0);
+        avatar.render(2.4);
+        let paint = avatar.glyph_paint.as_ref().expect("the glyph is showing");
+        for part in [Part::Ring, Part::Ball] {
+            let sprite = paint.sprite(part).expect("baked");
+            assert!(sprite.pixmap.data().chunks_exact(4).any(|px| px[3] == 255));
+        }
+    }
+
+    #[test]
+    fn a_hollow_piece_keeps_its_hole() {
+        let cfg =
+            Avatar::new(BotAvatarType::Blob, BotAvatarState::Progress, 64, 2.0).build_config();
+        let ring = bake_part(cfg, Part::Ring, 64, 2.0).expect("baked");
+        let [x, y, w, h] = ring.rect;
+        let (pw, ph) = (ring.pixmap.width() as f64, ring.pixmap.height() as f64);
+        // Glyph units to the piece's pixels.
+        let alpha = |gx: f64, gy: f64| {
+            let px = ((gx - x) / w * pw) as usize;
+            let py = ((gy - y) / h * ph) as usize;
+            ring.pixmap.data()[(py * ring.pixmap.width() as usize + px) * 4 + 3]
+        };
+        assert_eq!(alpha(0.0, 0.0), 0, "the middle stays empty");
+        assert_eq!(alpha(10.0, 0.0), 0);
+        assert_eq!(alpha(24.0, 0.0), 255, "the band is solid");
+        assert_eq!(alpha(0.0, -24.0), 255);
     }
 
     #[test]

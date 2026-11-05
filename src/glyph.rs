@@ -2,12 +2,15 @@
 //! shrinks away with a half turn and the glyph grows in its place; going back, the glyph
 //! shrinks and the body returns turning the other way.
 //!
-//! Glyphs are drawn in the body's own colour as soft cushioned balls and strokes, lit from
-//! the same side as the fabric, so they read as made of the same stuff.
+//! Glyphs are made of the body's own stuff: the avatar bakes each solid piece (a ball, a
+//! bar, a ring, a pin) in the body's plastic, fur and light, and the glyph lays those bakes
+//! down as it moves. A piece not baked yet draws as a soft cushioned shape in the body's
+//! colour, lit from the same side.
 
+use std::collections::HashMap;
 use std::f64::consts::{PI, TAU};
 
-use tiny_skia::{LineCap, Path, PathBuilder};
+use tiny_skia::{FillRule, LineCap, LineJoin, Path, PathBuilder, Pixmap, Stroke};
 
 use crate::canvas::{Canvas2D, PaintStyle};
 use crate::color::shade;
@@ -73,6 +76,156 @@ impl Glyph {
             _ => None,
         }
     }
+}
+
+impl Glyph {
+    /// The solid pieces this glyph is made of.
+    pub const fn parts(self) -> &'static [Part] {
+        match self {
+            Glyph::Progress => &[Part::Ring, Part::Ball],
+            Glyph::Receive => &[Part::Tray, Part::Ball],
+            Glyph::Dock => &[Part::Bar, Part::Ball],
+            Glyph::Bang => &[Part::Bang, Part::Ball],
+            Glyph::Standby => &[Part::PowerArc, Part::PowerBar],
+            Glyph::Pin => &[Part::Pin],
+            Glyph::Pencil => &[Part::Pencil],
+            _ => &[Part::Ball],
+        }
+    }
+}
+
+/// A solid piece of a glyph, baked in the body's material. Thin lines (radar waves, orbits,
+/// pulses) and shadows are light and shade, not stuff, and stay flat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Part {
+    /// A ball; every ball in every glyph scales from this one.
+    Ball,
+    /// The progress ring, shown as far as it has filled.
+    Ring,
+    /// The dock's bar.
+    Bar,
+    /// The exclamation mark's stroke.
+    Bang,
+    /// The power sign's ring.
+    PowerArc,
+    /// The power sign's bar.
+    PowerBar,
+    /// The tray a ball drops into.
+    Tray,
+    /// The map pin.
+    Pin,
+    /// The pencil's body and point.
+    Pencil,
+}
+
+/// The radius [`Part::Ball`] is baked at.
+const BALL_R: f64 = 12.0;
+/// The progress ring's radius and width.
+const RING: (f64, f64) = (24.0, 8.0);
+
+impl Part {
+    /// A name for the piece, unique among them.
+    pub const fn key(self) -> &'static str {
+        match self {
+            Part::Ball => "ball",
+            Part::Ring => "ring",
+            Part::Bar => "bar",
+            Part::Bang => "bang",
+            Part::PowerArc => "power-arc",
+            Part::PowerBar => "power-bar",
+            Part::Tray => "tray",
+            Part::Pin => "pin",
+            Part::Pencil => "pencil",
+        }
+    }
+
+    /// How long its fur grows, against the body's, and how round it swells (1 a cushion,
+    /// toward 0 a slab). Thin pieces take short fur and a flatter top, or the fur and the
+    /// shaded rim are all there is of them.
+    pub const fn look(self) -> (f64, f64) {
+        match self {
+            Part::Ball => (0.8, 1.0),
+            Part::Bar | Part::Bang | Part::PowerBar | Part::Pencil | Part::Pin => (0.6, 0.8),
+            Part::Ring | Part::PowerArc | Part::Tray => (0.4, 0.55),
+        }
+    }
+
+    /// Whether the piece wraps around empty space (a ring, an arc, a tray). The front is
+    /// painted as copies of the outline shrinking toward its middle, lighter as they go; for
+    /// these the lighter copies land in the empty middle, so the bake is brought up to the
+    /// body's own brightness.
+    pub const fn hollow(self) -> bool {
+        matches!(self, Part::Ring | Part::PowerArc | Part::Tray)
+    }
+
+    /// The piece's outline in glyph units: the body's own units, centred where the body is.
+    pub fn path(self) -> Option<Path> {
+        match self {
+            Part::Ball => crate::canvas::circle_path(0.0, 0.0, BALL_R),
+            Part::Ring => annulus(RING.0 + RING.1 / 2.0, RING.0 - RING.1 / 2.0),
+            Part::Bar => stroked(&line(-17.0, 0.0, 17.0, 0.0)?, 6.0),
+            Part::Bang => stroked(&line(0.0, -42.0, 0.0, -18.0)?, 11.0),
+            Part::PowerArc => stroked(
+                &arc_path(0.0, 2.0, 20.0, -PI / 2.0 + 0.62, 1.5 * PI - 0.62)?,
+                8.5,
+            ),
+            Part::PowerBar => stroked(&line(0.0, -24.0, 0.0, -4.0)?, 7.0),
+            Part::Tray => stroked(&tray_path(0.0, 20.0, 40.0)?, 7.0),
+            Part::Pin => pin_path(0.0, 0.0),
+            Part::Pencil => pencil_path(),
+        }
+    }
+}
+
+/// A baked piece: its pixels, and the box they cover in glyph units.
+pub struct Sprite {
+    pub pixmap: Pixmap,
+    /// x, y, width, height.
+    pub rect: [f64; 4],
+}
+
+impl Sprite {
+    fn lay(&self, ctx: &mut Canvas2D) {
+        let [x, y, w, h] = self.rect;
+        ctx.draw_image(&self.pixmap, x, y, w, h);
+    }
+}
+
+fn line(x0: f64, y0: f64, x1: f64, y1: f64) -> Option<Path> {
+    let mut pb = PathBuilder::new();
+    pb.move_to(x0 as f32, y0 as f32);
+    pb.line_to(x1 as f32, (y1 + 1e-3) as f32);
+    pb.finish()
+}
+
+/// A stroke `w` wide around `path`, with round ends and corners, as an outline to fill.
+fn stroked(path: &Path, w: f64) -> Option<Path> {
+    let stroke = Stroke {
+        width: w as f32,
+        line_cap: LineCap::Round,
+        line_join: LineJoin::Round,
+        ..Stroke::default()
+    };
+    path.stroke(&stroke, 4.0)
+}
+
+/// A ring between two radii: the outer circle one way round, the inner the other.
+fn annulus(outer: f64, inner: f64) -> Option<Path> {
+    let mut pb = PathBuilder::new();
+    let n = 96;
+    for (r, dir) in [(outer, 1.0), (inner, -1.0)] {
+        for i in 0..=n {
+            let a = dir * f64::from(i) * TAU / f64::from(n);
+            let (x, y) = ((r * a.cos()) as f32, (r * a.sin()) as f32);
+            if i == 0 {
+                pb.move_to(x, y);
+            } else {
+                pb.line_to(x, y);
+            }
+        }
+        pb.close();
+    }
+    pb.finish()
 }
 
 const AMOUNT_OMEGA: f64 = 13.0;
@@ -249,13 +402,17 @@ impl GlyphAnim {
     }
 }
 
-/// The colours a glyph is made of, from the body colour.
+/// The colours a glyph is made of, from the body colour, and its baked pieces.
 pub struct GlyphPaint {
     light: String,
     base: String,
     dark: String,
     deep: String,
     ink: String,
+    /// Each piece baked so far; `None` when its bake came out empty.
+    sprites: HashMap<Part, Option<Sprite>>,
+    /// The size and scale the pieces were baked at.
+    res: (u32, u32),
 }
 
 impl GlyphPaint {
@@ -266,6 +423,46 @@ impl GlyphPaint {
             dark: shade(color, -0.16, 0.04),
             deep: shade(color, -0.3, 0.06),
             ink: ink.to_string(),
+            sprites: HashMap::new(),
+            res: (0, 0),
+        }
+    }
+
+    /// The pieces `glyphs` need that are not baked at `res` yet. A new `res` drops the old
+    /// bakes.
+    pub fn missing(&mut self, res: (u32, u32), glyphs: &[Option<Glyph>]) -> Vec<Part> {
+        if res != self.res {
+            self.sprites.clear();
+            self.res = res;
+        }
+        let mut out: Vec<Part> = Vec::new();
+        for part in glyphs.iter().flatten().flat_map(|g| g.parts()) {
+            if !self.sprites.contains_key(part) && !out.contains(part) {
+                out.push(*part);
+            }
+        }
+        out
+    }
+
+    /// Keeps the bake of `part`.
+    pub fn put(&mut self, part: Part, sprite: Option<Sprite>) {
+        self.sprites.insert(part, sprite);
+    }
+
+    pub(crate) fn sprite(&self, part: Part) -> Option<&Sprite> {
+        self.sprites.get(&part).and_then(Option::as_ref)
+    }
+
+    /// The same colours, with no pieces.
+    fn tinted(&self, base: &str, dark: &str) -> GlyphPaint {
+        GlyphPaint {
+            light: self.light.clone(),
+            base: base.to_string(),
+            dark: dark.to_string(),
+            deep: self.deep.clone(),
+            ink: self.ink.clone(),
+            sprites: HashMap::new(),
+            res: self.res,
         }
     }
 }
@@ -367,7 +564,26 @@ fn draw_one(ctx: &mut Canvas2D, glyph: Glyph, t: f64, p: &GlyphPaint) {
             let fill = Bezier::IN_OUT.at((t / 2.6).clamp(0.0, 1.0));
             let a0 = -PI / 2.0;
             let a1 = a0 + TAU * fill.max(0.02);
-            arc_stroke(ctx, (0.0, 0.0, 24.0), a0, a1, 6.5, &p.base);
+            if let Some(ring) = p.sprite(Part::Ring) {
+                // The baked ring, cut to the wedge filled so far, with a round start.
+                let mut pb = PathBuilder::new();
+                pb.move_to(0.0, 0.0);
+                let steps = (((a1 - a0) / (PI / 24.0)).ceil() as usize).max(2);
+                for i in 0..=steps {
+                    let a = a0 + (a1 - a0) * i as f64 / steps as f64;
+                    pb.line_to((40.0 * a.cos()) as f32, (40.0 * a.sin()) as f32);
+                }
+                pb.close();
+                if let Some(wedge) = pb.finish() {
+                    ctx.save();
+                    ctx.clip_path(&wedge, FillRule::Winding);
+                    ring.lay(ctx);
+                    ctx.restore();
+                }
+                ball(ctx, 0.0, -RING.0, RING.1 / 2.0, p);
+            } else {
+                arc_stroke(ctx, (0.0, 0.0, RING.0), a0, a1, RING.1, &p.base);
+            }
             let (hx, hy) = (24.0 * a1.cos(), 24.0 * a1.sin());
             ball(ctx, hx, hy, 4.4, p);
             ball(ctx, 0.0, 0.0, 7.0 + 1.6 * fill, p);
@@ -398,7 +614,7 @@ fn draw_one(ctx: &mut Canvas2D, glyph: Glyph, t: f64, p: &GlyphPaint) {
                 let amp = 0.45 + 0.55 * ((t * 3.1 + fi * 1.7).sin() * 0.5 + 0.5);
                 let h = 12.0 * amp * (t * TAU * 1.3 - fi * 0.7).sin().abs();
                 let x = (fi - 2.0) * 12.0;
-                capsule(ctx, x, -h / 2.0 - 1.0, x, h / 2.0 + 1.0, 8.4, p);
+                upright(ctx, x, h / 2.0 + 1.0, 8.4, p);
             }
         }
         Glyph::Send => {
@@ -420,7 +636,11 @@ fn draw_one(ctx: &mut Canvas2D, glyph: Glyph, t: f64, p: &GlyphPaint) {
         }
         Glyph::Receive => {
             ctx.set_global_alpha(0.9);
-            tray(ctx, 0.0, 20.0, 40.0, &p.dark);
+            if let Some(tray_sprite) = p.sprite(Part::Tray) {
+                tray_sprite.lay(ctx);
+            } else {
+                tray(ctx, 0.0, 20.0, 40.0, &p.dark);
+            }
             ctx.set_global_alpha(1.0);
             let q = (t / 1.5).rem_euclid(1.0);
             let (y, sx, sy, a) = if q < 0.45 {
@@ -444,7 +664,16 @@ fn draw_one(ctx: &mut Canvas2D, glyph: Glyph, t: f64, p: &GlyphPaint) {
             let q = (t / 1.4).rem_euclid(1.0);
             let rise = Bezier::IN_OUT.at((q / 0.6).min(1.0));
             let glow = bump(q, 0.55, 0.85);
-            capsule(ctx, -17.0, -26.0, 17.0, -26.0, 6.0 + 1.5 * glow, p);
+            let w = 6.0 + 1.5 * glow;
+            if let Some(bar) = p.sprite(Part::Bar) {
+                ctx.save();
+                ctx.translate(0.0, -26.0);
+                ctx.scale(1.0, w / 6.0);
+                bar.lay(ctx);
+                ctx.restore();
+            } else {
+                capsule(ctx, -17.0, -26.0, 17.0, -26.0, w, p);
+            }
             let y = 22.0 - 42.0 * rise;
             let r = 8.0 * (1.0 - 0.5 * smoothstep((q - 0.5) / 0.12));
             if q < 0.62 {
@@ -490,7 +719,11 @@ fn draw_one(ctx: &mut Canvas2D, glyph: Glyph, t: f64, p: &GlyphPaint) {
             ctx.translate(0.0, -10.0 * hop + 22.0);
             ctx.scale(1.0 + 0.1 * land, 1.0 - 0.1 * land);
             ctx.rotate(tilt);
-            capsule(ctx, 0.0, -42.0, 0.0, -18.0, 11.0, p);
+            if let Some(bang) = p.sprite(Part::Bang) {
+                bang.lay(ctx);
+            } else {
+                capsule(ctx, 0.0, -42.0, 0.0, -18.0, 11.0, p);
+            }
             ball(ctx, 0.0, -5.0, 6.2, p);
             ctx.restore();
         }
@@ -498,21 +731,32 @@ fn draw_one(ctx: &mut Canvas2D, glyph: Glyph, t: f64, p: &GlyphPaint) {
             // The ring dims and brightens like a sleeping light; the bar stays lit.
             let dim = 0.4 + 0.6 * (0.5 + 0.5 * (t * TAU / 2.4).cos());
             ctx.set_global_alpha(dim);
-            arc_stroke(
-                ctx,
-                (0.0, 2.0, 20.0),
-                -PI / 2.0 + 0.62,
-                1.5 * PI - 0.62,
-                7.0,
-                &p.base,
-            );
+            if let Some(arc) = p.sprite(Part::PowerArc) {
+                arc.lay(ctx);
+            } else {
+                arc_stroke(
+                    ctx,
+                    (0.0, 2.0, 20.0),
+                    -PI / 2.0 + 0.62,
+                    1.5 * PI - 0.62,
+                    7.0,
+                    &p.base,
+                );
+            }
             ctx.set_global_alpha(1.0);
-            capsule(ctx, 0.0, -24.0, 0.0, -4.0, 7.0, p);
+            if let Some(bar) = p.sprite(Part::PowerBar) {
+                bar.lay(ctx);
+            } else {
+                capsule(ctx, 0.0, -24.0, 0.0, -4.0, 7.0, p);
+            }
         }
         Glyph::Pin => {
+            // It drops in once, then hops a little each round as the rings go out; a drop
+            // every round would snap it back up out of nowhere.
             let q = (t / 2.2).rem_euclid(1.0);
-            let drop = Bezier::OVERSHOOT.at((q / 0.32).min(1.0));
-            let y = -22.0 * (1.0 - drop);
+            let drop = Bezier::OVERSHOOT.at((t / 0.7).min(1.0));
+            let hop = if t < 2.2 { 0.0 } else { bump(q, 0.0, 0.28) };
+            let y = -22.0 * (1.0 - drop) - 5.0 * hop;
             for k in 0..2 {
                 let r = ((q - 0.3 - f64::from(k) * 0.18) / 0.5).clamp(0.0, 1.0);
                 if r > 0.0 && r < 1.0 {
@@ -521,7 +765,14 @@ fn draw_one(ctx: &mut Canvas2D, glyph: Glyph, t: f64, p: &GlyphPaint) {
                 }
             }
             ctx.set_global_alpha(0.3);
-            shadow(ctx, 0.0, 24.0, 8.0 * (0.6 + 0.4 * drop), 2.5, &p.deep);
+            shadow(
+                ctx,
+                0.0,
+                24.0,
+                8.0 * (0.6 + 0.4 * drop) * (1.0 - 0.2 * hop),
+                2.5,
+                &p.deep,
+            );
             ctx.set_global_alpha(1.0);
             pin(ctx, 0.0, y, p);
         }
@@ -538,6 +789,14 @@ fn ball(ctx: &mut Canvas2D, x: f64, y: f64, r: f64, p: &GlyphPaint) {
     if r <= 0.05 {
         return;
     }
+    if let Some(sprite) = p.sprite(Part::Ball) {
+        ctx.save();
+        ctx.translate(x, y);
+        ctx.scale(r / BALL_R, r / BALL_R);
+        sprite.lay(ctx);
+        ctx.restore();
+        return;
+    }
     let Some(path) = crate::canvas::circle_path(x, y, r) else {
         return;
     };
@@ -551,6 +810,20 @@ fn ball(ctx: &mut Canvas2D, x: f64, y: f64, r: f64, p: &GlyphPaint) {
         &[(0.0, &p.light), (0.55, &p.base), (1.0, &p.dark)],
     ));
     ctx.fill_path(&path);
+}
+
+/// An upright rounded bar `w` wide centred on (x, 0), its round ends at -half and +half: the
+/// baked ball drawn tall, or a flat capsule.
+fn upright(ctx: &mut Canvas2D, x: f64, half: f64, w: f64, p: &GlyphPaint) {
+    if let Some(sprite) = p.sprite(Part::Ball) {
+        ctx.save();
+        ctx.translate(x, 0.0);
+        ctx.scale(w / 2.0 / BALL_R, (half + w / 2.0) / BALL_R);
+        sprite.lay(ctx);
+        ctx.restore();
+    } else {
+        capsule(ctx, x, -half, x, half, w, p);
+    }
 }
 
 /// A rounded bar from one point to another, shaded like a ball.
@@ -660,6 +933,15 @@ fn shadow(ctx: &mut Canvas2D, cx: f64, cy: f64, rx: f64, ry: f64, color: &str) {
 }
 
 fn tray(ctx: &mut Canvas2D, cx: f64, cy: f64, w: f64, color: &str) {
+    if let Some(path) = tray_path(cx, cy, w) {
+        ctx.set_stroke_css(color);
+        ctx.set_line_width(5.0);
+        ctx.stroke_path(&path);
+    }
+}
+
+/// The tray's line, to stroke 5 wide.
+fn tray_path(cx: f64, cy: f64, w: f64) -> Option<Path> {
     let h = w / 2.0;
     let mut pb = PathBuilder::new();
     pb.move_to((cx - h) as f32, (cy - 8.0) as f32);
@@ -678,11 +960,7 @@ fn tray(ctx: &mut Canvas2D, cx: f64, cy: f64, w: f64, color: &str) {
         cy as f32,
     );
     pb.line_to((cx + h) as f32, (cy - 8.0) as f32);
-    if let Some(path) = pb.finish() {
-        ctx.set_stroke_css(color);
-        ctx.set_line_width(5.0);
-        ctx.stroke_path(&path);
-    }
+    pb.finish()
 }
 
 fn chevron(ctx: &mut Canvas2D, cx: f64, cy: f64, w: f64, color: &str) {
@@ -719,6 +997,33 @@ fn scribble(ctx: &mut Canvas2D, q: f64, color: &str) {
 
 /// A pencil pointing down its own +y, the tip at the origin.
 fn pencil(ctx: &mut Canvas2D, p: &GlyphPaint) {
+    if let Some(sprite) = p.sprite(Part::Pencil) {
+        sprite.lay(ctx);
+    } else {
+        pencil_flat(ctx, p);
+    }
+    pencil_ends(ctx, p);
+}
+
+/// The pencil's body and point in one outline: a round top, straight sides, a cone.
+fn pencil_path() -> Option<Path> {
+    let mut pb = PathBuilder::new();
+    pb.move_to(-6.0, -14.0);
+    pb.line_to(-6.0, -40.0);
+    let steps = 16;
+    for i in 1..=steps {
+        let a = PI + PI * f64::from(i) / f64::from(steps);
+        pb.line_to((6.0 * a.cos()) as f32, (-40.0 + 6.0 * a.sin()) as f32);
+    }
+    pb.line_to(6.0, -14.0);
+    pb.line_to(1.2, -2.4);
+    pb.quad_to(0.0, 0.0, -1.2, -2.4);
+    pb.close();
+    pb.finish()
+}
+
+/// The pencil drawn flat: a cushioned body and a wooden cone.
+fn pencil_flat(ctx: &mut Canvas2D, p: &GlyphPaint) {
     capsule(ctx, 0.0, -40.0, 0.0, -14.0, 12.0, p);
     let mut pb = PathBuilder::new();
     pb.move_to(-6.0, -14.0);
@@ -736,6 +1041,10 @@ fn pencil(ctx: &mut Canvas2D, p: &GlyphPaint) {
         ));
         ctx.fill_path(&path);
     }
+}
+
+/// The lead and the eraser, over either pencil.
+fn pencil_ends(ctx: &mut Canvas2D, p: &GlyphPaint) {
     let mut tip = PathBuilder::new();
     tip.move_to(-2.4, -5.8);
     tip.line_to(2.4, -5.8);
@@ -754,19 +1063,39 @@ fn pencil(ctx: &mut Canvas2D, p: &GlyphPaint) {
         4.0,
         -44.0,
         6.0,
-        &GlyphPaint {
-            light: p.light.clone(),
-            base: p.deep.clone(),
-            dark: p.deep.clone(),
-            deep: p.deep.clone(),
-            ink: p.ink.clone(),
-        },
+        &p.tinted(&p.deep, &p.deep),
     );
     ctx.set_global_alpha(1.0);
 }
 
 /// A map pin with its point at (x, y + 24).
 fn pin(ctx: &mut Canvas2D, x: f64, y: f64, p: &GlyphPaint) {
+    let (cx, cy, r) = (x, y - 6.0, 15.0);
+    if let Some(sprite) = p.sprite(Part::Pin) {
+        ctx.save();
+        ctx.translate(x, y);
+        sprite.lay(ctx);
+        ctx.restore();
+    } else if let Some(path) = pin_path(x, y) {
+        ctx.set_fill_style(PaintStyle::radial_gradient(
+            cx - 0.4 * r,
+            cy - 0.45 * r,
+            0.0,
+            cx,
+            cy + 4.0,
+            r * 1.6,
+            &[(0.0, &p.light), (0.5, &p.base), (1.0, &p.dark)],
+        ));
+        ctx.fill_path(&path);
+    }
+    if let Some(hole) = crate::canvas::circle_path(cx, cy, 5.6) {
+        ctx.set_fill_css(&p.deep);
+        ctx.fill_path(&hole);
+    }
+}
+
+/// The pin's outline, its point at (x, y + 24).
+fn pin_path(x: f64, y: f64) -> Option<Path> {
     let (cx, cy, r) = (x, y - 6.0, 15.0);
     let mut pb = PathBuilder::new();
     let tipy = y + 24.0;
@@ -790,22 +1119,7 @@ fn pin(ctx: &mut Canvas2D, x: f64, y: f64, p: &GlyphPaint) {
         tipy as f32,
     );
     pb.close();
-    if let Some(path) = pb.finish() {
-        ctx.set_fill_style(PaintStyle::radial_gradient(
-            cx - 0.4 * r,
-            cy - 0.45 * r,
-            0.0,
-            cx,
-            cy + 4.0,
-            r * 1.6,
-            &[(0.0, &p.light), (0.5, &p.base), (1.0, &p.dark)],
-        ));
-        ctx.fill_path(&path);
-    }
-    if let Some(hole) = crate::canvas::circle_path(cx, cy, 5.6) {
-        ctx.set_fill_css(&p.deep);
-        ctx.fill_path(&hole);
-    }
+    pb.finish()
 }
 
 #[cfg(test)]
