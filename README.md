@@ -45,13 +45,14 @@ let _ = bot.render(1.0);
 
 ## Gallery
 
-```shell
-cargo run --release --example gallery -- /tmp/shapes.png all default 1.0 64
-cargo run --release --example gallery -- film /tmp/frames blob all 12 64
-cargo run --release --example gallery -- timeline /tmp/life blob,heart 22 "3:thinking,6:streaming,10:coding,16:finished,19.5:poke-spin" 96
-```
+The live gallery (every bot in every state, body, and face, with pokes, looks, and the
+pointer) and the sheet and film renderer live in the workspace's `gallery` folder, beside
+this library:
 
-`film` writes a frame per 1/30 s with every listed state side by side; `timeline` plays a list of `seconds:state`, `seconds:poke-<poke>`, `seconds:look-<look>`, or `seconds:face-<expression>` events.
+```shell
+cd ../gallery && cargo run --release
+cargo run --release --bin bot-sheets -- /tmp/shapes.png all default 1.0 64
+```
 
 The device canvas is `round(size_px * 1.5 * scale)` pixels on a side. At 64px scale 2 that is 192.
 

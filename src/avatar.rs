@@ -93,6 +93,10 @@ pub struct Avatar {
     /// Pokes, looks, and faces asked for, with the step they came at, so a rewind replays
     /// them where they happened.
     events: Vec<(u64, Event)>,
+    /// The pose and glyph the canvas holds now. A render at the same pose keeps the pixmap.
+    painted: Option<(Pose, crate::glyph::GlyphFrame)>,
+    /// Whether the last render painted a new frame.
+    fresh: bool,
 }
 
 /// Something asked of the motion layer at a moment.
@@ -181,6 +185,8 @@ impl Avatar {
             glyph: crate::glyph::GlyphFrame::NONE,
             glyph_paint: None,
             events: Vec::new(),
+            painted: None,
+            fresh: false,
         }
     }
 
@@ -276,8 +282,18 @@ impl Avatar {
     /// The sim is rebuilt and stepped from t = 0 when `time_seconds` is earlier
     /// than the last call. The same time is the same step count, so with no pointer the
     /// pixmap bytes depend only on kind, state, size, scale, and time.
+    ///
+    /// A bot that holds still is not painted again: the same pose hands back the same
+    /// pixmap, and [`Avatar::frame_changed`] says false.
     pub fn render(&mut self, time_seconds: f64) -> &Pixmap {
         self.advance(time_seconds);
+        let now = (self.pose, self.glyph);
+        if self.painted == Some(now) {
+            self.fresh = false;
+            return &self.canvas.pixmap;
+        }
+        self.painted = Some(now);
+        self.fresh = true;
         if self.cfg.is_none() {
             self.cfg = Some(self.build_config());
         }
@@ -320,6 +336,12 @@ impl Avatar {
             );
         }
         &self.canvas.pixmap
+    }
+
+    /// Whether the last [`Avatar::render`] painted a new frame. False when the bot held still,
+    /// so a caller can keep the image it uploaded.
+    pub fn frame_changed(&self) -> bool {
+        self.fresh
     }
 
     fn advance(&mut self, time_seconds: f64) {
@@ -415,6 +437,13 @@ impl Avatar {
                 fabric: true,
             }),
         }
+    }
+}
+
+impl Drop for Avatar {
+    /// The painter keeps scratch per canvas; a gone avatar frees its share.
+    fn drop(&mut self) {
+        crate::plastic_cap::forget_states(&self.canvas);
     }
 }
 

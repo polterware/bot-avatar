@@ -17,7 +17,7 @@ use std::collections::{HashMap, HashSet};
 use std::f64::consts::{PI, TAU};
 use std::hash::{Hash, Hasher};
 use std::mem;
-use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use tiny_skia::{BlendMode, FillRule, FilterQuality, LineJoin, Path, Pixmap};
 
@@ -146,7 +146,7 @@ pub struct CapState {
     pub sprite_px: f64,
     pub sprite_fur: Option<Arc<Fur>>,
     /// Front-view body, design space, reused while shading inputs stay put.
-    pub card: Option<Pixmap>,
+    pub card: Option<Arc<Pixmap>>,
     pub card_stamp: u64,
     /// Opaque pixel bounds of `card`: x0, y0, x1, y1.
     pub card_box: [i32; 4],
@@ -237,16 +237,37 @@ static SOFTS: LazyLock<Mutex<HashMap<(u64, u32), Option<Pixmap>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static MISSES: LazyLock<Mutex<HashMap<String, Option<[f64; 2]>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+/// Baked front cards shared by every canvas: bots with the same body, colour, light, and size
+/// bake once. Keyed by the card stamp and the canvas state key.
+static CARDS: LazyLock<Mutex<HashMap<(u64, String), SharedCard>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+/// A baked card and its opaque pixel bounds.
+type SharedCard = (Arc<Pixmap>, [i32; 4]);
+/// Past this many cards the cache starts over.
+const CARDS_MAX: usize = 256;
 
 /// Holds the cap-state map so [`state_for`] can hand back one record.
 pub(crate) struct StateGuard {
-    guard: MutexGuard<'static, HashMap<String, CapState>>,
+    /// Taken out of the shared map while held, so painting holds no global lock and canvases
+    /// paint in parallel. A canvas is painted by one thread at a time.
+    state: Option<CapState>,
     key: String,
 }
 
 impl StateGuard {
     pub(crate) fn get(&mut self) -> &mut CapState {
-        self.guard.get_mut(&self.key).expect("cap state")
+        self.state.as_mut().expect("cap state")
+    }
+}
+
+impl Drop for StateGuard {
+    fn drop(&mut self) {
+        if let Some(state) = self.state.take() {
+            STATES
+                .lock()
+                .expect("cap states")
+                .insert(mem::take(&mut self.key), state);
+        }
     }
 }
 
@@ -702,15 +723,18 @@ pub(crate) fn state_for(ctx: &Canvas2D, outline: &str) -> StateGuard {
     let addr = ctx.id;
     let key = format!("{addr}|{outline}");
     let mut guard = STATES.lock().expect("cap states");
-    if !guard.contains_key(&key) {
+    let state = guard.remove(&key).unwrap_or_else(|| {
         let prefix = format!("{addr}|");
         let n = guard.keys().filter(|k| k.starts_with(&prefix)).count();
         if n > 16 {
             guard.retain(|k, _| !k.starts_with(&prefix));
         }
-        guard.insert(key.clone(), CapState::fresh());
+        CapState::fresh()
+    });
+    StateGuard {
+        state: Some(state),
+        key,
     }
-    StateGuard { guard, key }
 }
 
 /// Drop every state a canvas keeps, once that canvas is gone.
@@ -1952,6 +1976,8 @@ fn fast_stamp(
     q(&mut h, rig.dev);
     q(&mut h, rig.bx.unwrap_or(f64::NAN));
     q(&mut h, rig.by.unwrap_or(f64::NAN));
+    q(&mut h, rig.cap);
+    q(&mut h, rig.round);
     mix_stamp(&mut h, [u8::from(fabric)]);
     h
 }
@@ -2077,27 +2103,78 @@ fn sample_card(src: &[u8], stride: usize, sw: i32, sh: i32, fx: f32, fy: f32) ->
     let sy = fy.floor() as i32;
     let tx = fx - sx as f32;
     let ty = fy - sy as f32;
-    let texel = |ix: i32, iy: i32| -> [u32; 4] {
-        if ix < 0 || iy < 0 || ix >= sw || iy >= sh {
-            return [0; 4];
-        }
-        let o = iy as usize * stride + ix as usize * 4;
-        [
-            src[o] as u32,
-            src[o + 1] as u32,
-            src[o + 2] as u32,
-            src[o + 3] as u32,
-        ]
+    let word = |o: usize| u32::from_le_bytes([src[o], src[o + 1], src[o + 2], src[o + 3]]);
+    let (c00, c10, c01, c11) = if sx >= 0 && sy >= 0 && sx + 1 < sw && sy + 1 < sh {
+        // Inside the card: the four texels with no edge checks.
+        let o = sy as usize * stride + sx as usize * 4;
+        debug_assert!(o + stride + 8 <= src.len());
+        let at = |i: usize| {
+            // SAFETY: `sx + 1 < sw` and `sy + 1 < sh`, so both rows' two texels are in `src`,
+            // which holds `sh` rows of `stride` bytes.
+            unsafe { u32::from_le(src.as_ptr().add(i).cast::<u32>().read_unaligned()) }
+        };
+        (at(o), at(o + 4), at(o + stride), at(o + stride + 4))
+    } else {
+        let texel = |ix: i32, iy: i32| -> u32 {
+            if ix < 0 || iy < 0 || ix >= sw || iy >= sh {
+                0
+            } else {
+                word(iy as usize * stride + ix as usize * 4)
+            }
+        };
+        (
+            texel(sx, sy),
+            texel(sx + 1, sy),
+            texel(sx, sy + 1),
+            texel(sx + 1, sy + 1),
+        )
     };
-    let c00 = texel(sx, sy);
-    let c10 = texel(sx + 1, sy);
-    let c01 = texel(sx, sy + 1);
-    let c11 = texel(sx + 1, sy + 1);
+    if c00 | c10 | c01 | c11 == 0 {
+        // Clear card around the body: nothing to blend.
+        return [0; 4];
+    }
+    bilerp_texels([c00, c10, c01, c11], tx, ty)
+}
+
+/// Bilinear blend of four packed RGBA8 texels (top left, top right, bottom left, bottom
+/// right), each channel rounded half away from zero.
+#[cfg(not(target_arch = "aarch64"))]
+#[inline(always)]
+fn bilerp_texels(c: [u32; 4], tx: f32, ty: f32) -> [u32; 4] {
     let mut px = [0u32; 4];
-    for ch in 0..4 {
-        let top = c00[ch] as f32 + (c10[ch] as f32 - c00[ch] as f32) * tx;
-        let bot = c01[ch] as f32 + (c11[ch] as f32 - c01[ch] as f32) * tx;
-        px[ch] = (top + (bot - top) * ty).round() as u32;
+    for (ch, out) in px.iter_mut().enumerate() {
+        let k = 8 * ch as u32;
+        let a = ((c[0] >> k) & 255) as f32;
+        let b = ((c[1] >> k) & 255) as f32;
+        let c0 = ((c[2] >> k) & 255) as f32;
+        let d = ((c[3] >> k) & 255) as f32;
+        let top = a + (b - a) * tx;
+        let bot = c0 + (d - c0) * tx;
+        *out = (top + (bot - top) * ty).round() as u32;
+    }
+    px
+}
+
+/// The same blend, four channels at once. Separate multiplies and adds (no fused
+/// multiply-add) and `frinta` keep it bit for bit the scalar one.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn bilerp_texels(c: [u32; 4], tx: f32, ty: f32) -> [u32; 4] {
+    use std::arch::aarch64::{
+        vaddq_f32, vcreate_u8, vcvtq_f32_u32, vcvtq_u32_f32, vdupq_n_f32, vget_low_u16, vmovl_u8,
+        vmovl_u16, vmulq_f32, vrndaq_f32, vst1q_u32, vsubq_f32,
+    };
+    let mut px = [0u32; 4];
+    // SAFETY: NEON is part of every aarch64 target, and `px` holds the four lanes stored.
+    unsafe {
+        let widen =
+            |w: u32| vcvtq_f32_u32(vmovl_u16(vget_low_u16(vmovl_u8(vcreate_u8(u64::from(w))))));
+        let (a, b, c0, d) = (widen(c[0]), widen(c[1]), widen(c[2]), widen(c[3]));
+        let vtx = vdupq_n_f32(tx);
+        let top = vaddq_f32(a, vmulq_f32(vsubq_f32(b, a), vtx));
+        let bot = vaddq_f32(c0, vmulq_f32(vsubq_f32(d, c0), vtx));
+        let v = vaddq_f32(top, vmulq_f32(vsubq_f32(bot, top), vdupq_n_f32(ty)));
+        vst1q_u32(px.as_mut_ptr(), vcvtq_u32_f32(vrndaq_f32(v)));
     }
     px
 }
@@ -2243,7 +2320,16 @@ fn paint_fast(
     let state_key = format!("fast|{base}|{}|{}", form.id, u8::from(fabric));
     let mut states = state_for(ctx, &state_key);
     if states.get().card_stamp != stamp || states.get().card.is_none() {
-        // The slice painter keeps its own states, so it bakes with this lock released.
+        let shared = (stamp, format!("{state_key}|{outline_key}|{n}"));
+        let hit = CARDS.lock().expect("cards").get(&shared).cloned();
+        if let Some((card, card_box)) = hit {
+            let st = states.get();
+            st.card = Some(card);
+            st.card_box = card_box;
+            st.card_stamp = stamp;
+            return blit_state(ctx, rig, st);
+        }
+        // The slice painter keeps its own states, so it bakes with this one put back.
         drop(states);
         let Some(card) = bake_card(
             cfg,
@@ -2259,13 +2345,26 @@ fn paint_fast(
         ) else {
             return false;
         };
+        let card_box = opaque_box(&card);
+        let card = Arc::new(card);
+        {
+            let mut cards = CARDS.lock().expect("cards");
+            if cards.len() >= CARDS_MAX {
+                cards.clear();
+            }
+            cards.insert(shared, (card.clone(), card_box));
+        }
         states = state_for(ctx, &state_key);
         let st = states.get();
-        st.card_box = opaque_box(&card);
+        st.card_box = card_box;
         st.card = Some(card);
         st.card_stamp = stamp;
     }
-    let st = states.get();
+    blit_state(ctx, rig, states.get())
+}
+
+/// Poses the state's baked card: the front, and the darkened depth rim when the bot turns.
+fn blit_state(ctx: &mut Canvas2D, rig: &Rig, st: &CapState) -> bool {
     let front = slice_affine(rig, 0.0);
     let sign = if rig.facing < 0.0 { -1.0 } else { 1.0 };
     let back = slice_affine(rig, -sign * rig.half_depth);

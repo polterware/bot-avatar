@@ -69,3 +69,40 @@ fn a_glyph_state_draws_its_glyph_not_the_body() {
         "and the body is gone: {dots_px} vs {body_px}"
     );
 }
+
+#[test]
+fn a_bot_at_rest_keeps_its_frame() {
+    let mut avatar = Avatar::new(BotAvatarType::Pebble, BotAvatarState::Coding, 48, 2.0);
+    let first = avatar.render(0.75).data().to_vec();
+    assert!(avatar.frame_changed());
+    let again = avatar.render(0.75).data().to_vec();
+    assert!(!avatar.frame_changed(), "the same pose paints nothing");
+    assert_eq!(first, again);
+    let _ = avatar.render(0.9);
+    assert!(avatar.frame_changed(), "a coding bot moves on");
+}
+
+#[test]
+fn bots_on_threads_draw_what_one_thread_draws() {
+    let frames = |kind: BotAvatarType, state: BotAvatarState| {
+        let mut avatar = Avatar::new(kind, state, 40, 2.0);
+        [0.0, 0.6, 1.4]
+            .map(|t| avatar.render(t).data().to_vec())
+            .to_vec()
+    };
+    let bots = [
+        (BotAvatarType::Heart, BotAvatarState::Turntable),
+        (BotAvatarType::Mech, BotAvatarState::Working),
+        (BotAvatarType::Leaf, BotAvatarState::Happy),
+        (BotAvatarType::Heart, BotAvatarState::Working),
+    ];
+    let serial: Vec<_> = bots.iter().map(|&(k, s)| frames(k, s)).collect();
+    let threaded: Vec<_> = std::thread::scope(|scope| {
+        let handles: Vec<_> = bots
+            .iter()
+            .map(|&(k, s)| scope.spawn(move || frames(k, s)))
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    assert!(serial == threaded, "threads changed the pixels");
+}

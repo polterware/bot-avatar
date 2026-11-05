@@ -26,7 +26,9 @@ use tiny_skia::{BlendMode, FillRule, LineCap, LineJoin, Path, PathBuilder, PathS
 use crate::canvas::{Canvas2D, PaintStyle, RgbaColor, ellipse_path};
 use crate::color::shade;
 use crate::engine::Pose;
-use crate::plastic::{FurStyle, Material, Rig, draw_plastic_cap, mul_affine, surface_at};
+use crate::plastic::{
+    FurStyle, Material, Rig, draw_plastic_cap, mul_affine, surface_at_tier, tier_for,
+};
 use crate::types::{BotAvatarFace, BotAvatarShading, BotAvatarTheme};
 use crate::wear::{
     EyeSpot, FaceAnchor, GlassesPass, HeadTurn, ScreenLight, Wear, WearRig, draw_glasses,
@@ -923,7 +925,8 @@ pub fn draw(ctx: &mut Canvas2D, box_px: f64, pose: &Pose, cfg: &DrawConfig) {
     let sf = if cushion { 1.0 } else { profile(zf, cap) };
     let sample_surface = |x: f64, y: f64| -> f64 {
         if cushion {
-            surface_at(&type_key, half_depth, x, y, round).unwrap_or(0.8 * half_depth)
+            surface_at_tier(&type_key, tier_for(box_px * dpr), half_depth, x, y, round)
+                .unwrap_or(0.8 * half_depth)
         } else {
             half_depth * sf
         }

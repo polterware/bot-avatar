@@ -1110,7 +1110,8 @@ pub(crate) fn form_for(
         if let Some(hit) = store.map.get(&id) {
             return Some(Arc::clone(hit));
         }
-        if store.map.len() >= 48 {
+        // Every tier of every body and part on a full gallery page fits before it starts over.
+        if store.map.len() >= 192 {
             store.map.clear();
             store.order.clear();
         }
@@ -1279,7 +1280,33 @@ pub fn surface_at(key: &str, half_depth: f64, x: f64, y: f64, round: f64) -> Opt
             form = store.map.get(id).map(Arc::as_ref);
         }
     }
-    let form = form?;
+    surface_of(form?, x, y, round)
+}
+
+/// [`surface_at`] on the form of tier `n`, the one the body at this size is drawn from, so
+/// the answer does not depend on which sizes of the outline were drawn before. Falls back to
+/// the last form made for the outline while that tier is not built.
+pub(crate) fn surface_at_tier(
+    key: &str,
+    n: u32,
+    half_depth: f64,
+    x: f64,
+    y: f64,
+    round: f64,
+) -> Option<f64> {
+    let form = forms()
+        .lock()
+        .expect("forms")
+        .map
+        .get(&form_cache_id(key, n, half_depth))
+        .cloned();
+    match form {
+        Some(form) => surface_of(&form, x, y, round),
+        None => surface_at(key, half_depth, x, y, round),
+    }
+}
+
+fn surface_of(form: &Form, x: f64, y: f64, round: f64) -> Option<f64> {
     let n = form.n as usize;
     if n < 2 {
         return Some(0.0);

@@ -177,16 +177,21 @@ pub(crate) fn style_id(style: &FurStyle) -> String {
 }
 
 /// `furKey` (952).
+///
+/// `n` is the tier of the form the fur grows on: two sizes in one fur tier still bake from
+/// their own form, so neither depends on which was drawn first.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn fur_key(
     key: &str,
     half_depth: f64,
     r: u32,
+    n: u32,
     bin: i32,
     style: &FurStyle,
     lights: &FurLights,
 ) -> String {
     format!(
-        "{key}|{}|{r}|{bin}|{}|{}",
+        "{key}|{}|{r}|{n}|{bin}|{}|{}",
         js_round_i32(half_depth),
         style_id(style),
         lights_id(lights)
@@ -284,7 +289,7 @@ pub(crate) fn fur_ready(
 ) -> Option<Arc<Fur>> {
     let r = fur_tier(cap_px);
     let bin = light_bin(lx, ly);
-    let id = fur_key(key, half_depth, r, bin, style, lights);
+    let id = fur_key(key, half_depth, r, form.n, bin, style, lights);
     if let Some(hit) = cache_get(&id) {
         return Some(hit);
     }
@@ -305,7 +310,7 @@ pub(crate) fn fur_ready(
             let mut store = store().lock().expect("fur store");
             store.pending.insert(id.clone());
             store.dropped.remove(&id);
-            let shape = format!("{key}|{}|{r}|{bin}", js_round_i32(half_depth));
+            let shape = format!("{key}|{}|{r}|{}|{bin}", js_round_i32(half_depth), form.n);
             let olds = {
                 let line = store.queued.entry(shape).or_default();
                 line.push(id.clone());
@@ -332,7 +337,9 @@ pub(crate) fn fur_ready(
         }
     }
     note_missed();
-    first_with_prefix(&prefix)
+    // The bake above ran in place, so its own fur is ready. Only a dropped bake falls back
+    // to another fur of the same shape, which depends on what was drawn before.
+    cache_get(&id).or_else(|| first_with_prefix(&prefix))
 }
 
 /// `rng` (1166–1174). Returns values in `0..1`.
@@ -375,7 +382,7 @@ pub fn fur_for(
     lights: &FurLights,
 ) -> Fur {
     let r = fur_tier(cap_px);
-    let id = fur_key(key, half_depth, r, light_bin(lx, ly), style, lights);
+    let id = fur_key(key, half_depth, r, form.n, light_bin(lx, ly), style, lights);
     if let Some(hit) = cache_get(&id) {
         return (*hit).clone();
     }
@@ -948,13 +955,17 @@ static TIP_BUILDS: AtomicU64 = AtomicU64::new(0);
 static SHEEN_BUILDS: AtomicU64 = AtomicU64::new(0);
 static NEXT_FUR: AtomicU64 = AtomicU64::new(1);
 
+/// A hit moves to the back of the eviction order, so furs in use stay while unused ones go.
 fn cache_get(id: &str) -> Option<Arc<Fur>> {
-    store()
-        .lock()
-        .expect("fur store")
-        .furs
-        .get(id)
-        .map(Arc::clone)
+    let mut s = store().lock().expect("fur store");
+    let hit = s.furs.get(id).map(Arc::clone)?;
+    if s.order.last().map(String::as_str) != Some(id)
+        && let Some(at) = s.order.iter().position(|k| k == id)
+    {
+        let k = s.order.remove(at);
+        s.order.push(k);
+    }
+    Some(hit)
 }
 
 fn cache_has(id: &str) -> bool {
@@ -987,9 +998,12 @@ fn first_with_prefix(prefix: &str) -> Option<Arc<Fur>> {
     None
 }
 
+const FURS_MAX: usize = 96;
+
 fn file_fur(id: &str, fur: Fur) {
     let mut s = store().lock().expect("fur store");
-    if s.furs.len() >= 24 {
+    // Room for every body on a full gallery page; past it the least recently drawn goes.
+    if s.furs.len() >= FURS_MAX {
         if let Some(old) = s.order.first().cloned() {
             s.order.remove(0);
             if let Some(old_fur) = s.furs.remove(&old) {
@@ -3204,6 +3218,16 @@ mod tests {
     }
 
     #[test]
+    fn two_form_tiers_bake_two_furs() {
+        let lights = stock_lights(-1.0, 0.0);
+        let bin = light_bin(-1.0, 0.0);
+        let small = fur_key("blob", 9.75, 192, 64, bin, &FUR_STOCK, &lights);
+        let large = fur_key("blob", 9.75, 192, 96, bin, &FUR_STOCK, &lights);
+        assert_ne!(small, large);
+        assert!(small.starts_with("blob|10|") && large.starts_with("blob|10|"));
+    }
+
+    #[test]
     fn fur_tier_matches_thresholds() {
         assert_eq!(fur_tier(0.0), 192);
         assert_eq!(fur_tier(200.0), 192);
@@ -3348,6 +3372,7 @@ mod tests {
                 kind.as_str(),
                 9.75,
                 192,
+                96,
                 light_bin(-1.0, 0.0),
                 &FUR_STOCK,
                 &lights,

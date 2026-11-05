@@ -166,7 +166,7 @@ fn hop_squash(a: f64) -> f64 {
 }
 
 /// Complete instant pose of the avatar rig.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Pose {
     pub yaw: f64,
     pub pitch: f64,

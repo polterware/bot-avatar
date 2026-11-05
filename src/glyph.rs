@@ -98,7 +98,7 @@ pub struct GlyphAnim {
 }
 
 /// One frame of a glyph.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GlyphFrame {
     /// 0 the body, 1 fully the glyph.
     pub amount: f64,
