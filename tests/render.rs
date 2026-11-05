@@ -91,7 +91,7 @@ fn bots_on_threads_draw_what_one_thread_draws() {
             .to_vec()
     };
     let bots = [
-        (BotAvatarType::Heart, BotAvatarState::Turntable),
+        (BotAvatarType::Heart, BotAvatarState::Showcase),
         (BotAvatarType::Mech, BotAvatarState::Working),
         (BotAvatarType::Leaf, BotAvatarState::Happy),
         (BotAvatarType::Heart, BotAvatarState::Working),

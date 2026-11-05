@@ -155,7 +155,6 @@ pub fn spec_for(state: BotAvatarState) -> Option<Spec> {
             &PLAY_BOP,
             &IDLE_PEEK,
         ]),
-        S::Turntable => spec(&[&TURNTABLE]),
     })
 }
 

@@ -945,18 +945,6 @@ pub const WAKE_STRETCH: Clip = Clip {
 
 // Showing off.
 
-/// A slow, even turn.
-pub const TURNTABLE: Clip = Clip {
-    name: "turntable",
-    duration: 10.0,
-    rot: &[r(0.0, -6.0, 0.0, 0.0, LIN), r(10.0, -6.0, 360.0, 0.0, LIN)],
-    pos: &[],
-    squash: &[],
-    faces: &[],
-    blinks: &[2.5, 7.5],
-    whirls: &[],
-};
-
 /// One clean turn, then still.
 pub const LOGO_SPIN: Clip = Clip {
     name: "logo_spin",
@@ -1012,7 +1000,6 @@ pub const ALL: &[&Clip] = &[
     &NOTIFY_JUMP,
     &DRAG_DANGLE,
     &WAKE_STRETCH,
-    &TURNTABLE,
     &LOGO_SPIN,
 ];
 

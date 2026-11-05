@@ -356,8 +356,6 @@ pub enum BotAvatarState {
     Logo,
     /// A tour of poses.
     Showcase,
-    /// A slow full turn.
-    Turntable,
 }
 
 /// Alias for [`BotAvatarState`].
@@ -365,7 +363,7 @@ pub type AvatarState = BotAvatarState;
 
 impl BotAvatarState {
     /// Every state.
-    pub const ALL: [BotAvatarState; 54] = [
+    pub const ALL: [BotAvatarState; 53] = [
         BotAvatarState::Default,
         BotAvatarState::Working,
         BotAvatarState::Sleeping,
@@ -419,7 +417,6 @@ impl BotAvatarState {
         BotAvatarState::Dragging,
         BotAvatarState::Logo,
         BotAvatarState::Showcase,
-        BotAvatarState::Turntable,
     ];
 
     /// The three states of the classic rig.
@@ -484,7 +481,6 @@ impl BotAvatarState {
             BotAvatarState::Dragging => "dragging",
             BotAvatarState::Logo => "logo",
             BotAvatarState::Showcase => "showcase",
-            BotAvatarState::Turntable => "turntable",
         }
     }
 
