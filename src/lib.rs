@@ -15,6 +15,7 @@ pub mod types;
 pub mod wear;
 
 pub use avatar::{Avatar, MascotMood, kind_for_agent, state_for_status};
+pub use engine::Calm;
 
 #[cfg(test)]
 mod bootstrap_tests {

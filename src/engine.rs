@@ -363,6 +363,24 @@ const fn rest_for(state: BotAvatarState) -> Rest {
     }
 }
 
+/// How much of the rig moves. `Full` is the whole rig: wander, gaze turns, hops, flips. The
+/// calm ones hold the body in its state's rest pose and move only the face.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Calm {
+    #[default]
+    Full,
+    /// Only the eyes move, toward the pointer when there is one.
+    Gaze,
+    /// At work: the eyes read along a line and flick back, the body breathes, and the bot
+    /// blinks. A pointer takes the eyes over.
+    Busy,
+}
+
+/// Seconds of one read along a line and back in [`Calm::Busy`].
+const SCAN_SECONDS: f64 = 2.4;
+/// Share of a read spent sweeping left to right; the rest flicks back.
+const SCAN_SWEEP: f64 = 0.82;
+
 /// Rig simulator advancing a [`Pose`] through time.
 #[derive(Debug, Clone)]
 pub struct Sim {
@@ -408,6 +426,8 @@ pub struct Sim {
     breath_phase: f64,
     ptr_x: f64,
     ptr_y: f64,
+    calm: Calm,
+    scan_phase: f64,
     ptr_s: f64,
     ptr_target_x: f64,
     ptr_target_y: f64,
@@ -499,6 +519,8 @@ impl Sim {
             breath_phase,
             ptr_x: 0.0,
             ptr_y: 0.0,
+            calm: Calm::Full,
+            scan_phase: 0.0,
             ptr_s: 0.0,
             ptr_target_x: 0.0,
             ptr_target_y: 0.0,
@@ -559,6 +581,51 @@ impl Sim {
                 self.nod_at = self.t + 2.5 + self.rand.next() * 4.0;
             }
         }
+    }
+
+    /// Sets how much of the rig moves; see [`Calm`].
+    pub fn set_calm(&mut self, calm: Calm) {
+        self.calm = calm;
+    }
+
+    /// The calm rig: the state's rest pose with the face alone moving.
+    fn update_calm(&mut self, t: f64, dt: f64) {
+        self.ptr_s = approach(self.ptr_s, self.ptr_target_s, 8.0, dt);
+        self.ptr_x = approach(self.ptr_x, self.ptr_target_x, 14.0, dt);
+        self.ptr_y = approach(self.ptr_y, self.ptr_target_y, 14.0, dt);
+        let ps = self.ptr_s;
+        let mut pose = rest_pose(self.state);
+        if self.calm == Calm::Busy {
+            self.scan_phase = (self.scan_phase + dt / SCAN_SECONDS).fract();
+            let q = self.scan_phase;
+            let along = if q < SCAN_SWEEP {
+                ease_in_out(q / SCAN_SWEEP)
+            } else {
+                1.0 - ease_in_out((q - SCAN_SWEEP) / (1.0 - SCAN_SWEEP))
+            };
+            pose.look_x += (along * 2.0 - 1.0) * 3.0 * (1.0 - ps);
+            pose.look_y += 1.2 * (1.0 - ps);
+
+            self.breath_phase += dt / 3.6;
+            let breath = (self.breath_phase * TAU).sin();
+            pose.breath = breath;
+            pose.sx += breath * 0.008;
+            pose.sy += breath * 0.012;
+
+            if t >= self.blink_at && !self.blink.active() {
+                self.blink.fire();
+                self.blink_at = t + 2.2 + self.rand.next() * 2.6;
+            }
+            self.blink.update(dt);
+            if self.blink.active() {
+                let close = (PI * self.blink.p).sin();
+                pose.blink_l = close;
+                pose.blink_r = close;
+            }
+        }
+        pose.look_x += 4.5 * self.ptr_x * ps;
+        pose.look_y += 3.0 * self.ptr_y * ps;
+        self.pose = pose;
     }
 
     pub fn set_pointer(&mut self, x: f64, y: f64, strength: f64) {
@@ -634,6 +701,10 @@ impl Sim {
         dt = dt.min(0.05);
         self.t += dt;
         let t = self.t;
+        if self.calm != Calm::Full {
+            self.update_calm(t, dt);
+            return;
+        }
 
         if self.tr < 1.0 {
             self.tr = (self.tr + dt / self.tr_duration).min(1.0);

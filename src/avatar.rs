@@ -25,7 +25,7 @@ use crate::color::{auto_ink, richer, shade};
 use crate::draw::{DrawConfig, LIGHT_DEFAULTS, OVERSCAN, OutlineParts, WhirlKnobs, draw};
 #[cfg(test)]
 use crate::engine::Pose;
-use crate::engine::{JUMP_DEFAULTS, Sim};
+use crate::engine::{Calm, JUMP_DEFAULTS, Sim};
 use crate::plastic::FurStyle;
 use crate::presets::bot_avatar_preset;
 use crate::shapes::{body_path_for, part_paths_for, shape_part_colors};
@@ -77,6 +77,11 @@ pub struct Avatar {
     steps: u64,
     canvas: Canvas2D,
     cfg: Option<DrawConfig>,
+    /// Where the pointer is, as the rig reads it: x and y from the bot's centre to its edge
+    /// (-1 to 1, held to ±1.2 past it) and how strongly the bot looks at it (0 to 1).
+    /// `(0, 0, 0)` is no pointer.
+    pointer: (f64, f64, f64),
+    calm: Calm,
 }
 
 impl Avatar {
@@ -151,6 +156,8 @@ impl Avatar {
             steps: 0,
             canvas: Canvas2D::new(side, side),
             cfg: None,
+            pointer: (0.0, 0.0, 0.0),
+            calm: Calm::Full,
         }
     }
 
@@ -161,11 +168,31 @@ impl Avatar {
         apply_motion(&mut self.sim, state, self.motion);
     }
 
+    /// Sets how much of the rig moves; see [`Calm`]. A change replays the rig from t = 0.
+    pub fn set_calm(&mut self, calm: Calm) {
+        if calm == self.calm {
+            return;
+        }
+        // Replayed from t = 0, so two bots in the same calm at the same time share a pose.
+        self.calm = calm;
+        self.sim = new_sim(self.seed, self.state, self.motion);
+        self.sim.set_calm(calm);
+        self.steps = 0;
+    }
+
+    /// Makes the bot look at the pointer: `x` and `y` from its centre to its edge (-1 to 1),
+    /// `strength` from 0 (looks ahead) to 1. The head and eyes ease toward it over the next
+    /// steps; `(0, 0, 0)` lets them go back.
+    pub fn set_pointer(&mut self, x: f64, y: f64, strength: f64) {
+        let finite = |v: f64| if v.is_finite() { v } else { 0.0 };
+        self.pointer = (finite(x), finite(y), finite(strength));
+    }
+
     /// Pose and paint at `time_seconds`.
     ///
     /// The sim is rebuilt and stepped from t = 0 when `time_seconds` is earlier
-    /// than the last call. The same time is the same step count, so the pixmap
-    /// bytes depend only on kind, state, size, scale, and time.
+    /// than the last call. The same time is the same step count, so with no pointer the
+    /// pixmap bytes depend only on kind, state, size, scale, and time.
     pub fn render(&mut self, time_seconds: f64) -> &Pixmap {
         self.advance(time_seconds);
         if self.cfg.is_none() {
@@ -189,10 +216,12 @@ impl Avatar {
         let target = step_count(time_seconds);
         if target < self.steps {
             self.sim = new_sim(self.seed, self.state, self.motion);
+            self.sim.set_calm(self.calm);
             self.steps = 0;
         }
         while self.steps < target {
-            self.sim.set_pointer(0.0, 0.0, 0.0);
+            let (x, y, strength) = self.pointer;
+            self.sim.set_pointer(x, y, strength);
             self.sim.update(FIXED_DT);
             self.steps += 1;
         }
@@ -551,5 +580,64 @@ mod tests {
         assert_eq!(a.sim.state, BotAvatarState::Sleeping);
         a.advance(f64::NAN);
         assert_eq!(a.steps, 0);
+    }
+
+    #[test]
+    fn a_pointer_turns_the_bot_toward_it() {
+        // The pose, not a paint: painting fills the shared form and fur caches other tests count.
+        let mut ahead = Avatar::for_agent("codex", "idle", 28, 1.0);
+        ahead.advance(1.0);
+        let mut looking = Avatar::for_agent("codex", "idle", 28, 1.0);
+        looking.set_pointer(1.0, 0.0, 1.0);
+        looking.advance(1.0);
+        assert!(!same_pose(&looking.sim.pose, &ahead.sim.pose));
+        looking.set_pointer(f64::NAN, 0.0, 1.0);
+        assert_eq!(looking.pointer, (0.0, 0.0, 1.0));
+    }
+
+    #[test]
+    fn a_gazing_bot_moves_only_its_eyes() {
+        let rest = crate::engine::rest_pose(BotAvatarState::Working);
+        let mut bot = Avatar::for_agent("codex", "running", 28, 1.0);
+        bot.set_calm(crate::engine::Calm::Gaze);
+        bot.set_pointer(1.0, 1.0, 1.0);
+        bot.advance(3.0);
+        let pose = bot.sim.pose;
+        assert_eq!(
+            (pose.yaw, pose.pitch, pose.roll),
+            (rest.yaw, rest.pitch, rest.roll)
+        );
+        assert_eq!((pose.y, pose.sx, pose.sy), (rest.y, rest.sx, rest.sy));
+        assert!(
+            pose.look_x > rest.look_x + 3.0,
+            "looks right: {}",
+            pose.look_x
+        );
+        assert!(
+            pose.look_y > rest.look_y + 2.0,
+            "looks down: {}",
+            pose.look_y
+        );
+    }
+
+    #[test]
+    fn a_busy_bot_reads_and_breathes_without_hopping() {
+        let rest = crate::engine::rest_pose(BotAvatarState::Working);
+        let mut bot = Avatar::for_agent("codex", "running", 28, 1.0);
+        bot.set_calm(crate::engine::Calm::Busy);
+        let mut looks = Vec::new();
+        for i in 1..=40 {
+            bot.advance(f64::from(i) * 0.1);
+            let pose = bot.sim.pose;
+            assert_eq!(
+                (pose.yaw, pose.pitch, pose.y),
+                (rest.yaw, rest.pitch, rest.y)
+            );
+            looks.push(pose.look_x);
+        }
+        let (low, high) = looks
+            .iter()
+            .fold((f64::MAX, f64::MIN), |(lo, hi), &x| (lo.min(x), hi.max(x)));
+        assert!(high - low > 4.0, "the eyes sweep: {low}..{high}");
     }
 }
