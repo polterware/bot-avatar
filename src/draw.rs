@@ -669,6 +669,25 @@ pub(crate) fn draw_face(ctx: &mut Canvas2D, pose: &Pose, cfg: &DrawConfig) -> [E
         let w = k_open * EYE_RX * 2.0 * wide + k_shut * 2.8 + k_laugh * 4.4 + k_sleep * 4.0;
         let dx = look_x * (k_open + 0.5 * (k_shut + k_laugh));
         let dy = look_y * (k_open + 0.5 * k_shut);
+        if pose.eyes_mix > 0.0 {
+            let m = pose.eyes_mix.min(1.0);
+            let classic = crate::expression::EyeShape {
+                x0,
+                y0,
+                cy,
+                w,
+                dx,
+                dy,
+                tilt: 0.0,
+                cross: 0.0,
+            };
+            let mut e = pose.eyes[usize::from(side > 0.0)].with_lid(lid);
+            e.dx += look_x;
+            e.dy += look_y;
+            let shape = classic.lerp(e, m);
+            draw_expression_eye(ctx, ink, side * half, ey, yaw, pitch, &shape);
+            continue;
+        }
         place_feature(ctx, side * half + dx, ey + dy, yaw, pitch, 1.0, |ctx| {
             ctx.set_stroke_css(ink);
             ctx.set_line_width(w);
@@ -712,6 +731,35 @@ pub(crate) fn draw_face(ctx: &mut Canvas2D, pose: &Pose, cfg: &DrawConfig) -> [E
         }
     };
     [spot(-half), spot(half)]
+}
+
+/// One eye from the motion layer: the classic stroke, turned by `tilt`, split into an X by
+/// `cross`.
+fn draw_expression_eye(
+    ctx: &mut Canvas2D,
+    ink: &str,
+    x: f64,
+    y: f64,
+    yaw: f64,
+    pitch: f64,
+    e: &crate::expression::EyeShape,
+) {
+    place_feature(ctx, x + e.dx, y + e.dy, yaw, pitch, 1.0, |ctx| {
+        ctx.set_stroke_css(ink);
+        ctx.set_line_width(js_max(0.4, e.w));
+        let path = eye_path(e.x0, e.y0, e.cy);
+        let spread = e.cross.clamp(0.0, 1.0) * std::f64::consts::FRAC_PI_4;
+        if e.tilt == 0.0 && spread == 0.0 {
+            ctx.stroke_path(&path);
+            return;
+        }
+        ctx.rotate(e.tilt + spread);
+        ctx.stroke_path(&path);
+        if spread > 1e-3 {
+            ctx.rotate(-2.0 * spread);
+            ctx.stroke_path(&path);
+        }
+    });
 }
 
 /// Draw one frame (`draw`, 273–510).

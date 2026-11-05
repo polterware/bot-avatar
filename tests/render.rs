@@ -30,3 +30,42 @@ fn same_time_is_identical() {
     let rewound = a.render(0.4).data().to_vec();
     assert_eq!(first, rewound);
 }
+
+#[test]
+fn a_poke_replays_where_it_happened_after_a_rewind() {
+    use bot_avatar::Poke;
+    let mut a = Avatar::new(BotAvatarType::Circle, BotAvatarState::Coding, 48, 1.0);
+    a.render(0.5);
+    a.poke(Poke::Spin, 1);
+    let first = a.render(0.9).data().to_vec();
+    let _later = a.render(2.0);
+    let rewound = a.render(0.9).data().to_vec();
+    assert_eq!(first, rewound);
+    let mut plain = Avatar::new(BotAvatarType::Circle, BotAvatarState::Coding, 48, 1.0);
+    assert_ne!(first, plain.render(0.9).data().to_vec());
+}
+
+#[test]
+fn finished_moves_on_to_idle_by_itself() {
+    let mut a = Avatar::new(BotAvatarType::Blob, BotAvatarState::Default, 48, 1.0);
+    a.render(0.2);
+    a.set_state(BotAvatarState::Finished);
+    a.render(1.0);
+    assert_eq!(a.state(), BotAvatarState::Finished);
+    a.render(8.0);
+    assert_eq!(a.state(), BotAvatarState::Default);
+}
+
+#[test]
+fn a_glyph_state_draws_its_glyph_not_the_body() {
+    let mut body = Avatar::new(BotAvatarType::Square, BotAvatarState::Default, 64, 1.0);
+    let mut dots = Avatar::new(BotAvatarType::Square, BotAvatarState::Thinking, 64, 1.0);
+    let lit = |data: &[u8]| data.chunks_exact(4).filter(|px| px[3] > 128).count();
+    let body_px = lit(body.render(1.0).data());
+    let dots_px = lit(dots.render(1.0).data());
+    assert!(dots_px > 50, "the dots show: {dots_px}");
+    assert!(
+        dots_px * 4 < body_px,
+        "and the body is gone: {dots_px} vs {body_px}"
+    );
+}

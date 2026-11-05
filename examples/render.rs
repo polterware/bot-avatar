@@ -63,10 +63,10 @@ fn avatar_for(kind_s: &str, state: BotAvatarState, size: u32, scale: f32) -> Ava
 
 fn usage() -> ExitCode {
     eprintln!("Usage: render <kind-or-agent> <state> <out_dir>");
-    eprintln!(
-        "kind: clover, flower, triangle, square, blob, ghost, circle, drop, star, droid, mech, alien, hexagon, cat, cloud, pill, pebble, puddle"
-    );
+    let kinds: Vec<&str> = BotAvatarType::ALL.iter().map(|k| k.as_str()).collect();
+    eprintln!("kind: {}", kinds.join(", "));
     eprintln!("agent: claude, codex, grok, cursor, gemini, copilot, ...");
-    eprintln!("state: default, working, sleeping");
+    let states: Vec<&str> = BotAvatarState::ALL.iter().map(|s| s.as_str()).collect();
+    eprintln!("state: {}", states.join(", "));
     ExitCode::from(2)
 }

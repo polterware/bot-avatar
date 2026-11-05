@@ -1,21 +1,32 @@
 pub mod agent_marks;
 pub mod avatar;
 pub mod canvas;
+pub mod clip;
+pub mod clips;
 pub mod color;
 pub mod draw;
+pub mod ease;
 pub mod engine;
+pub mod expression;
+pub mod glyph;
 pub mod mesh;
 pub mod plastic;
 pub mod plastic_cap;
 pub mod plastic_fur;
+pub mod poke;
 pub mod presets;
 pub mod shapes;
+pub mod stage;
 pub mod ticker;
 pub mod types;
 pub mod wear;
 
 pub use avatar::{Avatar, MascotMood, kind_for_agent, state_for_status};
 pub use engine::Calm;
+pub use expression::Expression;
+pub use glyph::Glyph;
+pub use poke::Poke;
+pub use stage::Look;
 
 #[cfg(test)]
 mod bootstrap_tests {

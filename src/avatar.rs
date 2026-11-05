@@ -22,13 +22,15 @@ use tiny_skia::Pixmap;
 use crate::agent_marks::{agent_mark_for, bot_type_for, dispatch_bot_state, seed_for};
 use crate::canvas::Canvas2D;
 use crate::color::{auto_ink, richer, shade};
-use crate::draw::{DrawConfig, LIGHT_DEFAULTS, OVERSCAN, OutlineParts, WhirlKnobs, draw};
-#[cfg(test)]
-use crate::engine::Pose;
-use crate::engine::{Calm, JUMP_DEFAULTS, Sim};
+use crate::draw::{DrawConfig, LIGHT_DEFAULTS, OVERSCAN, OutlineParts, RISE, WhirlKnobs, draw};
+use crate::engine::{Calm, JUMP_DEFAULTS, Pose, Sim};
+use crate::expression::Expression;
+use crate::glyph::{GlyphPaint, draw_glyph};
 use crate::plastic::FurStyle;
+use crate::poke::Poke;
 use crate::presets::bot_avatar_preset;
 use crate::shapes::{body_path_for, part_paths_for, shape_part_colors};
+use crate::stage::{COMPACT_PX, Layer, Look, Stage};
 use crate::ticker::FIXED_DT;
 use crate::types::{
     BotAvatarFace, BotAvatarShading, BotAvatarState, BotAvatarTheme, BotAvatarType,
@@ -82,6 +84,24 @@ pub struct Avatar {
     /// `(0, 0, 0)` is no pointer.
     pointer: (f64, f64, f64),
     calm: Calm,
+    /// The motion layer: clips, faces, pokes, looks, glyphs.
+    stage: Stage,
+    /// The rig's pose with the motion layer over it, as drawn.
+    pose: Pose,
+    glyph: crate::glyph::GlyphFrame,
+    glyph_paint: Option<GlyphPaint>,
+    /// Pokes, looks, and faces asked for, with the step they came at, so a rewind replays
+    /// them where they happened.
+    events: Vec<(u64, Event)>,
+}
+
+/// Something asked of the motion layer at a moment.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Event {
+    Poke(Poke, u32),
+    Look(Look),
+    Face(Option<Expression>, bool),
+    Blink,
 }
 
 impl Avatar {
@@ -118,9 +138,7 @@ impl Avatar {
         let trimmed = agent_id.trim();
         let key = if trimmed.is_empty() { "agent" } else { trimmed };
         let kind = kind_for_agent(key);
-        let state = status
-            .parse::<BotAvatarState>()
-            .unwrap_or_else(|_| state_for_status(status));
+        let state = agent_state(status);
         let color = agent_mark_for(key).map(|mark| mark.color.to_string());
         Self::build(
             kind,
@@ -158,14 +176,73 @@ impl Avatar {
             cfg: None,
             pointer: (0.0, 0.0, 0.0),
             calm: Calm::Full,
+            stage: Stage::new(seed, state, size_px < COMPACT_PX),
+            pose: Pose::default(),
+            glyph: crate::glyph::GlyphFrame::NONE,
+            glyph_paint: None,
+            events: Vec::new(),
         }
     }
 
     /// Point the rig at `state`. A later rewind replays from t = 0 in that state.
+    ///
+    /// The classic states run the classic rig. The others hand the body to the motion
+    /// layer, which bridges from the current pose into the new state's clips.
     pub fn set_state(&mut self, state: BotAvatarState) {
         self.state = state;
         self.sim.set_state(state, false);
+        self.sim.set_quiet(!state.is_classic());
         apply_motion(&mut self.sim, state, self.motion);
+        self.stage.set_state(state);
+    }
+
+    /// The state now. A state with a `next` (finished, waking, blocked...) moves on by
+    /// itself, so this can differ from the last [`Avatar::set_state`].
+    pub fn state(&self) -> BotAvatarState {
+        self.state
+    }
+
+    /// The face the eyes show now.
+    pub fn expression(&self) -> Expression {
+        self.stage.expression()
+    }
+
+    /// The clip the motion layer plays now (`"rest"` for the classic states).
+    pub fn clip_name(&self) -> &'static str {
+        self.stage.clip_name()
+    }
+
+    /// Lays a short move over whatever the bot is doing. `turns` counts the turns of a
+    /// [`Poke::Spin`]; the others ignore it.
+    pub fn poke(&mut self, poke: Poke, turns: u32) {
+        self.push(Event::Poke(poke, turns));
+    }
+
+    /// Turns the head to `look` and holds it there; [`Look::Center`] lets it go.
+    pub fn look(&mut self, look: Look) {
+        self.push(Event::Look(look));
+    }
+
+    /// Holds `face` over every state, or gives the face back to the state with `None`.
+    /// `through_blink` swaps the shape behind a blink instead of morphing it.
+    pub fn set_expression(&mut self, face: Option<Expression>, through_blink: bool) {
+        self.push(Event::Face(face, through_blink));
+    }
+
+    /// Blinks once, unless the face is one without open eyes.
+    pub fn blink(&mut self) {
+        self.push(Event::Blink);
+    }
+
+    /// Whether frames would change on their own: false once a classic bot in a calm rig has
+    /// nothing left to play.
+    pub fn is_animating(&self) -> bool {
+        !(self.calm != Calm::Full && self.state.is_classic() && self.stage.is_settled())
+    }
+
+    fn push(&mut self, event: Event) {
+        self.events.push((self.steps, event));
+        apply_event(&mut self.stage, event);
     }
 
     /// Sets how much of the rig moves; see [`Calm`]. A change replays the rig from t = 0.
@@ -175,8 +252,14 @@ impl Avatar {
         }
         // Replayed from t = 0, so two bots in the same calm at the same time share a pose.
         self.calm = calm;
+        self.restart();
+    }
+
+    /// Back to t = 0 in the current state; the asked-for events replay as the clock passes them.
+    fn restart(&mut self) {
         self.sim = new_sim(self.seed, self.state, self.motion);
-        self.sim.set_calm(calm);
+        self.sim.set_calm(self.calm);
+        self.stage = Stage::new(self.seed, self.state, self.size_px < COMPACT_PX);
         self.steps = 0;
     }
 
@@ -203,27 +286,74 @@ impl Avatar {
         let side = device_side(self.size_px, self.scale);
         self.canvas.ensure_size(side, side);
         self.canvas.set_transform(scale, 0.0, 0.0, scale, 0.0, 0.0);
-        draw(
-            &mut self.canvas,
-            box_px,
-            &self.sim.pose,
-            self.cfg.as_ref().expect("config"),
-        );
+        let cfg = self.cfg.as_ref().expect("config");
+        let glyph = self.glyph;
+        let mut pose = self.pose;
+        if glyph.amount > 0.0 {
+            // The body shrinks toward its centre and turns away as the glyph grows.
+            let k = (1.0 - glyph.amount).powf(1.3);
+            pose.y -= 50.0 * pose.sy * (1.0 - k);
+            pose.sx *= k;
+            pose.sy *= k;
+            pose.yaw += glyph.spin;
+        } else {
+            pose.yaw += glyph.spin;
+        }
+        if pose.sx > 0.015 {
+            draw(&mut self.canvas, box_px, &pose, cfg);
+        } else {
+            let full = box_px * OVERSCAN;
+            self.canvas.clear_rect(0.0, 0.0, full, full);
+        }
+        if glyph.amount > 0.0 {
+            let paint = self
+                .glyph_paint
+                .get_or_insert_with(|| GlyphPaint::new(&cfg.color, &cfg.ink));
+            let full = box_px * OVERSCAN;
+            draw_glyph(
+                &mut self.canvas,
+                full,
+                full / 2.0 + RISE * box_px,
+                box_px,
+                &glyph,
+                paint,
+            );
+        }
         &self.canvas.pixmap
     }
 
     fn advance(&mut self, time_seconds: f64) {
         let target = step_count(time_seconds);
-        if target < self.steps {
-            self.sim = new_sim(self.seed, self.state, self.motion);
-            self.sim.set_calm(self.calm);
-            self.steps = 0;
+        let replay = target < self.steps;
+        if replay {
+            self.restart();
         }
         while self.steps < target {
+            if replay || self.steps < self.events.last().map_or(0, |e| e.0) {
+                for &(at, event) in &self.events {
+                    if at == self.steps {
+                        apply_event(&mut self.stage, event);
+                    }
+                }
+            }
             let (x, y, strength) = self.pointer;
             self.sim.set_pointer(x, y, strength);
             self.sim.update(FIXED_DT);
+            let layer = self.stage.update(FIXED_DT, self.calm, self.pointer);
+            let moved = self.stage.state();
+            if moved != self.state {
+                // The director moved on by itself (a finished bot goes idle).
+                self.state = moved;
+                self.sim.set_state(moved, false);
+                self.sim.set_quiet(!moved.is_classic());
+                apply_motion(&mut self.sim, moved, self.motion);
+            }
+            self.pose = compose(&self.sim.pose, &layer);
+            self.glyph = layer.glyph;
             self.steps += 1;
+        }
+        if self.steps == 0 {
+            self.pose = self.sim.pose;
         }
     }
 
@@ -290,8 +420,37 @@ impl Avatar {
 
 fn new_sim(seed: f64, state: BotAvatarState, motion: Motion) -> Sim {
     let mut sim = Sim::new(seed, state);
+    sim.set_quiet(!state.is_classic());
     apply_motion(&mut sim, state, motion);
     sim
+}
+
+fn apply_event(stage: &mut Stage, event: Event) {
+    match event {
+        Event::Poke(poke, turns) => stage.poke(poke, turns),
+        Event::Look(look) => stage.look(look),
+        Event::Face(face, through) => stage.set_expression(face, through),
+        Event::Blink => stage.blink(),
+    }
+}
+
+/// The rig's pose with the motion layer laid over it. A layer at rest leaves the pose as it is.
+fn compose(base: &Pose, l: &Layer) -> Pose {
+    let mut p = *base;
+    p.pitch += l.pitch;
+    p.yaw += l.yaw;
+    p.roll += l.roll;
+    p.x += l.x;
+    p.y += l.y;
+    p.sx *= l.sx;
+    p.sy *= l.sy;
+    p.eyes = l.eyes;
+    p.eyes_mix = l.eyes_mix;
+    if l.whirl > p.whirl {
+        p.whirl = l.whirl;
+        p.whirl_angle = l.whirl_angle;
+    }
+    p
 }
 
 /// `DispatchAgentAvatar`: `jumpEvery: 0, turn: 0.35` unless the run works, else the
@@ -316,6 +475,26 @@ pub fn kind_for_agent(agent_id: &str) -> BotAvatarType {
     agent_mark_for(key)
         .map(|mark| mark.kind)
         .unwrap_or_else(|| bot_type_for(key))
+}
+
+/// A run status maps the way Dispatch does; any other word is a state's name, and an unknown
+/// word is idle.
+fn agent_state(status: &str) -> BotAvatarState {
+    const RUN_STATUSES: [&str; 6] = [
+        "pending",
+        "running",
+        "failed",
+        "cancelled",
+        "canceled",
+        "timed_out",
+    ];
+    let lower = status.trim().to_ascii_lowercase();
+    if RUN_STATUSES.contains(&lower.as_str()) {
+        return state_for_status(&lower);
+    }
+    lower
+        .parse::<BotAvatarState>()
+        .unwrap_or_else(|_| state_for_status(status))
 }
 
 /// Dispatch run status. `"idle"` is not a run state, so it is [`BotAvatarState::Default`].

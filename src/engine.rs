@@ -1,5 +1,6 @@
 use std::f64::consts::{PI, TAU};
 
+use crate::expression::EyeShape;
 use crate::types::{BotAvatarSquashEase, BotAvatarState};
 
 pub const STATES: [BotAvatarState; 3] = [
@@ -69,10 +70,10 @@ impl Default for JumpConfig {
 
 #[inline]
 const fn switch_to(state: BotAvatarState) -> f64 {
-    match state {
-        BotAvatarState::Default => 1.2,
+    match state.base() {
         BotAvatarState::Working => 0.7,
         BotAvatarState::Sleeping => 1.4,
+        _ => 1.2,
     }
 }
 
@@ -184,6 +185,10 @@ pub struct Pose {
     pub whirl: f64,
     pub whirl_angle: f64,
     pub w: [f64; 3],
+    /// Expression eyes from the motion layer, mixed over the classic ones by `eyes_mix`.
+    pub eyes: [EyeShape; 2],
+    /// 0 the classic eyes, 1 [`Pose::eyes`].
+    pub eyes_mix: f64,
 }
 
 impl Default for Pose {
@@ -338,14 +343,7 @@ struct Rest {
 }
 
 const fn rest_for(state: BotAvatarState) -> Rest {
-    match state {
-        BotAvatarState::Default => Rest {
-            pitch: 0.0,
-            roll: 0.0,
-            y: 0.0,
-            look_x: 0.0,
-            look_y: 0.0,
-        },
+    match state.base() {
         BotAvatarState::Working => Rest {
             pitch: 5.0 * DEG,
             roll: 0.0,
@@ -359,6 +357,13 @@ const fn rest_for(state: BotAvatarState) -> Rest {
             y: 3.0,
             look_x: 0.0,
             look_y: 1.0,
+        },
+        _ => Rest {
+            pitch: 0.0,
+            roll: 0.0,
+            y: 0.0,
+            look_x: 0.0,
+            look_y: 0.0,
         },
     }
 }
@@ -468,6 +473,8 @@ pub struct Sim {
     ptr_target_y: f64,
     ptr_target_s: f64,
     base_yaw: f64,
+    /// The motion layer drives the body: hold the rest pose and only breathe.
+    quiet: bool,
 }
 
 impl Sim {
@@ -513,6 +520,8 @@ impl Sim {
                 whirl: 0.0,
                 whirl_angle: 0.0,
                 w: [1.0, 0.0, 0.0],
+                eyes: [EyeShape::OPEN; 2],
+                eyes_mix: 0.0,
             },
             state: BotAvatarState::Default,
             rand,
@@ -567,12 +576,15 @@ impl Sim {
             ptr_target_y: 0.0,
             ptr_target_s: 0.0,
             base_yaw: 0.0,
+            quiet: false,
         };
         sim.set_state(state, true);
         sim
     }
 
+    /// Points the rig at `next`'s classic base ([`BotAvatarState::base`]).
     pub fn set_state(&mut self, next: BotAvatarState, immediate: bool) {
+        let next = next.base();
         if next == self.state && !immediate {
             return;
         }
@@ -593,16 +605,6 @@ impl Sim {
             };
         }
         match next {
-            BotAvatarState::Default => {
-                self.yaw_w.set(GAZE_YAW, 2.6, 5.4, 2.0);
-                self.pitch_w.set(GAZE_PITCH, 2.8, 5.8, 1.8);
-                self.roll_w.set(GAZE_ROLL, 3.4, 6.6, 1.5);
-                self.gaze_at = 0.0;
-                self.gaze_dir = [0.0, 0.0];
-                self.look_x_w.set(3.6, 0.6, 2.2, 13.0);
-                self.look_y_w.set(2.4, 0.6, 2.2, 13.0);
-                self.flip_at = self.next_flip(self.t, 0.6);
-            }
             BotAvatarState::Working => {
                 self.yaw_w.set(16.0 * DEG, 0.9, 1.8, 4.0);
                 self.pitch_w.set(3.0 * DEG, 1.2, 2.4, 3.0);
@@ -621,12 +623,44 @@ impl Sim {
                 self.look_y_w.set(0.0, 2.0, 4.0, 2.0);
                 self.nod_at = self.t + 2.5 + self.rand.next() * 4.0;
             }
+            _ => {
+                self.yaw_w.set(GAZE_YAW, 2.6, 5.4, 2.0);
+                self.pitch_w.set(GAZE_PITCH, 2.8, 5.8, 1.8);
+                self.roll_w.set(GAZE_ROLL, 3.4, 6.6, 1.5);
+                self.gaze_at = 0.0;
+                self.gaze_dir = [0.0, 0.0];
+                self.look_x_w.set(3.6, 0.6, 2.2, 13.0);
+                self.look_y_w.set(2.4, 0.6, 2.2, 13.0);
+                self.flip_at = self.next_flip(self.t, 0.6);
+            }
         }
     }
 
     /// Sets how much of the rig moves; see [`Calm`].
     pub fn set_calm(&mut self, calm: Calm) {
         self.calm = calm;
+    }
+
+    /// Hands the body to the motion layer: the rig holds its rest pose, breathes, and lets
+    /// the eyes follow the pointer.
+    pub fn set_quiet(&mut self, quiet: bool) {
+        self.quiet = quiet;
+    }
+
+    fn update_quiet(&mut self, dt: f64) {
+        self.ptr_s = approach(self.ptr_s, self.ptr_target_s, 8.0, dt);
+        self.ptr_x = approach(self.ptr_x, self.ptr_target_x, 14.0, dt);
+        self.ptr_y = approach(self.ptr_y, self.ptr_target_y, 14.0, dt);
+        let ps = self.ptr_s;
+        let mut pose = rest_pose(self.state);
+        self.breath_phase += dt / 3.6;
+        let breath = (self.breath_phase * TAU).sin();
+        pose.breath = breath;
+        pose.sx += breath * 0.008;
+        pose.sy += breath * 0.012;
+        pose.look_x += 4.5 * self.ptr_x * ps;
+        pose.look_y += 3.0 * self.ptr_y * ps;
+        self.pose = pose;
     }
 
     /// The calm rig: the state's rest pose with the face alone moving.
@@ -817,6 +851,10 @@ impl Sim {
         dt = dt.min(0.05);
         self.t += dt;
         let t = self.t;
+        if self.quiet {
+            self.update_quiet(dt);
+            return;
+        }
         if self.calm != Calm::Full {
             self.update_calm(t, dt);
             return;
@@ -1137,10 +1175,10 @@ impl Sim {
 /// The still pose of a state, for reduced motion and the first paint.
 pub const fn rest_pose(state: BotAvatarState) -> Pose {
     let r = rest_for(state);
-    let w = match state {
-        BotAvatarState::Default => [1.0, 0.0, 0.0],
+    let w = match state.base() {
         BotAvatarState::Working => [0.0, 1.0, 0.0],
         BotAvatarState::Sleeping => [0.0, 0.0, 1.0],
+        _ => [1.0, 0.0, 0.0],
     };
     Pose {
         yaw: 0.0,
@@ -1160,5 +1198,7 @@ pub const fn rest_pose(state: BotAvatarState) -> Pose {
         whirl: 0.0,
         whirl_angle: 0.0,
         w,
+        eyes: [EyeShape::OPEN; 2],
+        eyes_mix: 0.0,
     }
 }
