@@ -409,7 +409,7 @@ pub(crate) fn fur_job(
     if cache_has(id) {
         return None;
     }
-    BAKES.fetch_add(1, Ordering::Relaxed);
+    BAKES.with(|n| n.set(n.get() + 1));
     let bake = Bake::prepare(form, id, r, lx, ly, style, lights);
     let n = bake.steps.len();
     let shared = Arc::new(Mutex::new(bake));
@@ -949,7 +949,10 @@ fn store() -> &'static Mutex<Store> {
     })
 }
 
-static BAKES: AtomicU64 = AtomicU64::new(0);
+thread_local! {
+    /// Fur bakes started on this thread. Per thread, so tests baking at once count apart.
+    static BAKES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 static GAP_BUILDS: AtomicU64 = AtomicU64::new(0);
 static TIP_BUILDS: AtomicU64 = AtomicU64::new(0);
 static SHEEN_BUILDS: AtomicU64 = AtomicU64::new(0);
@@ -3391,7 +3394,7 @@ mod tests {
     fn fur_for_caches_one_bake() {
         let form = disk_form();
         let lights = stock_lights(-1.0, 0.0);
-        let before = BAKES.load(Ordering::Relaxed);
+        let before = BAKES.with(std::cell::Cell::get);
         let fur = fur_for(
             &form,
             "disk-cache",
@@ -3416,7 +3419,7 @@ mod tests {
             &FUR_STOCK,
             &lights,
         );
-        assert_eq!(BAKES.load(Ordering::Relaxed), before + 1);
+        assert_eq!(BAKES.with(std::cell::Cell::get), before + 1);
         assert_eq!(again.cache_key, fur.cache_key);
         assert_eq!(
             again.dark.as_ref().unwrap().data(),
