@@ -146,10 +146,8 @@ pub struct CapState {
     pub sprite_px: f64,
     pub sprite_fur: Option<Arc<Fur>>,
     /// Front-view body, design space, reused while shading inputs stay put.
-    pub card: Option<Arc<Pixmap>>,
+    pub card: Option<Arc<BakedCard>>,
     pub card_stamp: u64,
-    /// Opaque pixel bounds of `card`: x0, y0, x1, y1.
-    pub card_box: [i32; 4],
     pub miss: [f64; 2],
     pub miss_at: [f64; 2],
     pub turn_at: [f64; 2],
@@ -217,7 +215,6 @@ impl CapState {
             sprite_fur: None,
             card: None,
             card_stamp: 0,
-            card_box: [0, 0, 0, 0],
             miss: [0.0, 0.0],
             miss_at: [0.0, 0.0],
             turn_at: [0.0, 0.0],
@@ -239,10 +236,42 @@ static MISSES: LazyLock<Mutex<HashMap<String, Option<[f64; 2]>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 /// Baked front cards shared by every canvas: bots with the same body, colour, light, and size
 /// bake once. Keyed by the card stamp and the canvas state key.
-static CARDS: LazyLock<Mutex<HashMap<(u64, String), SharedCard>>> =
+static CARDS: LazyLock<Mutex<HashMap<(u64, String), Arc<BakedCard>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
-/// A baked card and its opaque pixel bounds.
-type SharedCard = (Arc<Pixmap>, [i32; 4]);
+
+/// A baked front card and what posing it reads off it.
+pub(crate) struct BakedCard {
+    pub pixmap: Pixmap,
+    /// Bounds of the pixels with any alpha: x0, y0, x1, y1.
+    pub bbox: [i32; 4],
+    /// Mean colour of the opaque pixels: the body's side.
+    pub side: [u32; 3],
+    /// Each row's first and last column with any alpha; an empty row is `(MAX, MIN)`.
+    pub rows: Vec<(i32, i32)>,
+}
+
+impl BakedCard {
+    fn new(pixmap: Pixmap) -> Self {
+        let (w, h) = (pixmap.width() as usize, pixmap.height() as usize);
+        let data = pixmap.data();
+        let rows = (0..h)
+            .map(|y| {
+                let row = &data[y * w * 4..(y + 1) * w * 4];
+                let seen = |x: &usize| row[x * 4 + 3] != 0;
+                match ((0..w).find(seen), (0..w).rev().find(seen)) {
+                    (Some(a), Some(b)) => (a as i32, b as i32),
+                    _ => (i32::MAX, i32::MIN),
+                }
+            })
+            .collect();
+        Self {
+            bbox: opaque_box(&pixmap),
+            side: mean_opaque(&pixmap),
+            rows,
+            pixmap,
+        }
+    }
+}
 /// Past this many cards the cache starts over.
 const CARDS_MAX: usize = 256;
 
@@ -1982,6 +2011,23 @@ fn fast_stamp(
     h
 }
 
+/// The mean colour of the card's opaque pixels.
+fn mean_opaque(card: &Pixmap) -> [u32; 3] {
+    let (mut sum, mut n) = ([0u64; 3], 0u64);
+    for px in card.data().chunks_exact(4) {
+        if px[3] == 255 {
+            for (s, &c) in sum.iter_mut().zip(px) {
+                *s += u64::from(c);
+            }
+            n += 1;
+        }
+    }
+    if n == 0 {
+        return [0; 3];
+    }
+    sum.map(|s| (s / n) as u32)
+}
+
 fn opaque_box(card: &Pixmap) -> [i32; 4] {
     let w = card.width() as i32;
     let h = card.height() as i32;
@@ -2199,15 +2245,14 @@ fn over_premul(dst: &mut [u8], src: [u32; 4]) {
     dst[3] = (sa + (dst[3] as u32 * inv_a + 127) / 255).min(255) as u8;
 }
 
-/// Premultiplied source-over of the baked card. `back` is the darkened depth rim,
-/// drawn under the front. One walk: an opaque front pixel hides the rim.
-fn blit_cards(
-    dst: &mut Pixmap,
-    card: &Pixmap,
-    bounds: [i32; 4],
-    front: [f64; 6],
-    back: Option<([f64; 6], f64)>,
-) {
+/// Premultiplied source-over of the baked card at `front`, with `layers` (affine and shade,
+/// nearest first) under it, each the card's shape in the `side` colour. One walk: each pixel
+/// takes the front, then the layers behind it until it is opaque, and lays the stack over
+/// what is there.
+fn blit_cards(dst: &mut Pixmap, baked: &BakedCard, front: [f64; 6], layers: &[([f64; 6], f64)]) {
+    let card = &baked.pixmap;
+    let bounds = baked.bbox;
+    let side = baked.side;
     let dw = dst.width() as i32;
     let dh = dst.height() as i32;
     let sw_i = card.width() as i32;
@@ -2218,12 +2263,17 @@ fn blit_cards(
     let Some(front_m) = card_map(front, sw_i as f32) else {
         return;
     };
-    let back_m = back.and_then(|(m, gain)| card_map(m, sw_i as f32).map(|map| (map, gain)));
+    let unders: Vec<(CardMap, u32)> = layers
+        .iter()
+        .filter_map(|&(m, gain)| {
+            card_map(m, sw_i as f32).map(|map| (map, (gain.clamp(0.0, 1.0) * 255.0).round() as u32))
+        })
+        .collect();
     let Some((mut x0, mut y0, mut x1, mut y1)) = dest_box(front, sw_i as f64, bounds, dw, dh)
     else {
         return;
     };
-    if let Some((m, _)) = back {
+    for &(m, _) in layers {
         if let Some((bx0, by0, bx1, by1)) = dest_box(m, sw_i as f64, bounds, dw, dh) {
             x0 = x0.min(bx0);
             y0 = y0.min(by0);
@@ -2233,72 +2283,131 @@ fn blit_cards(
     }
     let src = card.data();
     let stride = sw_i as usize * 4;
-    let gain_u = back_m
-        .map(|(_, gain)| (gain.clamp(0.0, 1.0) * 255.0).round() as u32)
-        .unwrap_or(255);
     let out = dst.data_mut();
     let dst_stride = dw as usize * 4;
+    // Each layer's columns that can land on the card's opaque box, row by row.
+    let mut spans: Vec<(i32, i32)> = vec![(0, -1); unders.len()];
+    // The front's walk steps exactly as it always has, so a bot facing the viewer keeps its
+    // bytes.
     let mut fx_row = front_m.fx0 + front_m.fx_dy * y0 as f32;
     let mut fy_row = front_m.fy0 + front_m.fy_dy * y0 as f32;
-    let (mut bfx_row, mut bfy_row) = match back_m {
-        Some((map, _)) => (
-            map.fx0 + map.fx_dy * y0 as f32,
-            map.fy0 + map.fy_dy * y0 as f32,
-        ),
-        None => (0.0, 0.0),
-    };
     for y in y0..y1 {
         let row = y as usize * dst_stride;
+        let yf = y as f32;
         let mut fx = fx_row + front_m.fx_dx * x0 as f32;
         let mut fy = fy_row + front_m.fy_dx * x0 as f32;
-        let mut bfx = bfx_row;
-        let mut bfy = bfy_row;
-        if back_m.is_some() {
-            let map = &back_m.unwrap().0;
-            bfx += map.fx_dx * x0 as f32;
-            bfy += map.fy_dx * x0 as f32;
+        fx_row += front_m.fx_dy;
+        fy_row += front_m.fy_dy;
+        // Where the front can show: outside it the sample would be clear anyway.
+        let (front_lo, front_hi) = layer_span(&front_m, yf, baked, x0, x1);
+        let (mut any_lo, mut any_hi) = (i32::MAX, i32::MIN);
+        for (span, (map, _)) in spans.iter_mut().zip(&unders) {
+            *span = layer_span(map, yf, baked, x0, x1);
+            if span.0 <= span.1 {
+                any_lo = any_lo.min(span.0);
+                any_hi = any_hi.max(span.1);
+            }
         }
         for x in x0..x1 {
-            let px = sample_card(src, stride, sw_i, sh_i, fx, fy);
+            let in_front = x >= front_lo && x <= front_hi;
+            let under_any = x >= any_lo && x <= any_hi;
+            if !in_front && !under_any {
+                fx += front_m.fx_dx;
+                fy += front_m.fy_dx;
+                continue;
+            }
+            let mut acc = if in_front {
+                sample_card(src, stride, sw_i, sh_i, fx, fy)
+            } else {
+                [0; 4]
+            };
             fx += front_m.fx_dx;
             fy += front_m.fy_dx;
             let o = row + x as usize * 4;
-            if px[3] >= 255 {
-                out[o] = px[0].min(255) as u8;
-                out[o + 1] = px[1].min(255) as u8;
-                out[o + 2] = px[2].min(255) as u8;
+            if acc[3] < 255 && under_any {
+                let xf = x as f32;
+                for (&(map, gain), &(lo, hi)) in unders.iter().zip(&spans) {
+                    if x < lo || x > hi {
+                        continue;
+                    }
+                    let lx = map.fx0 + map.fx_dy * yf + map.fx_dx * xf;
+                    let ly = map.fy0 + map.fy_dy * yf + map.fy_dx * xf;
+                    let under = sample_card(src, stride, sw_i, sh_i, lx, ly);
+                    if under[3] == 0 {
+                        continue;
+                    }
+                    // What still shows through the stack so far.
+                    let left = 255 - acc[3].min(255);
+                    let a = under[3].min(255);
+                    let shade = |c: u32| (c * gain / 255) * a / 255;
+                    acc[0] += (shade(side[0]) * left + 127) / 255;
+                    acc[1] += (shade(side[1]) * left + 127) / 255;
+                    acc[2] += (shade(side[2]) * left + 127) / 255;
+                    acc[3] += (a * left + 127) / 255;
+                    if acc[3] >= 255 {
+                        break;
+                    }
+                }
+            }
+            if acc[3] >= 255 {
+                out[o] = acc[0].min(255) as u8;
+                out[o + 1] = acc[1].min(255) as u8;
+                out[o + 2] = acc[2].min(255) as u8;
                 out[o + 3] = 255;
-                if back_m.is_some() {
-                    let map = &back_m.unwrap().0;
-                    bfx += map.fx_dx;
-                    bfy += map.fy_dx;
-                }
-                continue;
+            } else if acc[3] != 0 {
+                over_premul(&mut out[o..o + 4], acc);
             }
-            if let Some((map, _)) = back_m {
-                let mut under = sample_card(src, stride, sw_i, sh_i, bfx, bfy);
-                bfx += map.fx_dx;
-                bfy += map.fy_dx;
-                if gain_u != 255 {
-                    under[0] = under[0] * gain_u / 255;
-                    under[1] = under[1] * gain_u / 255;
-                    under[2] = under[2] * gain_u / 255;
-                }
-                if under[3] != 0 {
-                    over_premul(&mut out[o..o + 4], under);
-                }
-            }
-            if px[3] != 0 {
-                over_premul(&mut out[o..o + 4], px);
-            }
-        }
-        fx_row += front_m.fx_dy;
-        fy_row += front_m.fy_dy;
-        if let Some((map, _)) = back_m {
-            bfx_row += map.fx_dy;
-            bfy_row += map.fy_dy;
         }
     }
+}
+
+/// The columns of row `y`, within `x0..x1`, where `map` can read a texel with alpha: first
+/// against the card's bounds, then against the extents of the card rows that stretch crosses.
+/// Outside them the layer samples nothing. Empty when `lo > hi`.
+fn layer_span(map: &CardMap, y: f32, card: &BakedCard, x0: i32, x1: i32) -> (i32, i32) {
+    let b = card.bbox;
+    let (fx_at, fy_at) = (map.fx0 + map.fx_dy * y, map.fy0 + map.fy_dy * y);
+    // Columns whose sample lies in (min - 1, max + 1) along one axis of the card.
+    let clip = |lo: &mut f32, hi: &mut f32, start: f32, step: f32, min: i32, max: i32| {
+        let (a, b) = (min as f32 - 1.0, max as f32 + 1.0);
+        if step.abs() < 1e-9 {
+            if start <= a || start >= b {
+                *lo = f32::INFINITY;
+            }
+            return;
+        }
+        let (t0, t1) = ((a - start) / step, (b - start) / step);
+        *lo = lo.max(t0.min(t1));
+        *hi = hi.min(t0.max(t1));
+    };
+    let (mut lo, mut hi) = (x0 as f32, (x1 - 1) as f32);
+    clip(&mut lo, &mut hi, fx_at, map.fx_dx, b[0], b[2] - 1);
+    clip(&mut lo, &mut hi, fy_at, map.fy_dx, b[1], b[3] - 1);
+    if lo > hi || lo.is_nan() || hi.is_nan() {
+        return (0, -1);
+    }
+    // The card rows this stretch reads, and the columns any of them fill.
+    let (ya, yb) = (fy_at + map.fy_dx * lo, fy_at + map.fy_dx * hi);
+    let r0 = (ya.min(yb).floor() as i32).max(0);
+    let r1 = (ya.max(yb).floor() as i32 + 1).min(card.rows.len() as i32 - 1);
+    let (mut c0, mut c1) = (i32::MAX, i32::MIN);
+    for r in r0..=r1 {
+        let (a, b) = card.rows[r as usize];
+        c0 = c0.min(a);
+        c1 = c1.max(b);
+    }
+    if c0 > c1 {
+        return (0, -1);
+    }
+    clip(&mut lo, &mut hi, fx_at, map.fx_dx, c0, c1);
+    if lo > hi || lo.is_nan() || hi.is_nan() {
+        return (0, -1);
+    }
+    // A pixel of margin each way for rounding.
+    (
+        (lo.floor() as i32 - 1).max(x0),
+        (hi.ceil() as i32 + 1).min(x1 - 1),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2322,12 +2431,11 @@ fn paint_fast(
     if states.get().card_stamp != stamp || states.get().card.is_none() {
         let shared = (stamp, format!("{state_key}|{outline_key}|{n}"));
         let hit = CARDS.lock().expect("cards").get(&shared).cloned();
-        if let Some((card, card_box)) = hit {
+        if let Some(card) = hit {
             let st = states.get();
             st.card = Some(card);
-            st.card_box = card_box;
             st.card_stamp = stamp;
-            return blit_state(ctx, rig, st);
+            return blit_state(ctx, rig, form, st);
         }
         // The slice painter keeps its own states, so it bakes with this one put back.
         drop(states);
@@ -2345,39 +2453,118 @@ fn paint_fast(
         ) else {
             return false;
         };
-        let card_box = opaque_box(&card);
-        let card = Arc::new(card);
+        let card = Arc::new(BakedCard::new(card));
         {
             let mut cards = CARDS.lock().expect("cards");
             if cards.len() >= CARDS_MAX {
                 cards.clear();
             }
-            cards.insert(shared, (card.clone(), card_box));
+            cards.insert(shared, card.clone());
         }
         states = state_for(ctx, &state_key);
         let st = states.get();
-        st.card_box = card_box;
         st.card = Some(card);
         st.card_stamp = stamp;
     }
-    blit_state(ctx, rig, states.get())
+    blit_state(ctx, rig, form, states.get())
 }
 
-/// Poses the state's baked card: the front, and the darkened depth rim when the bot turns.
-fn blit_state(ctx: &mut Canvas2D, rig: &Rig, st: &CapState) -> bool {
-    let front = slice_affine(rig, 0.0);
+/// Poses the state's baked card as a solid body. Facing the viewer it is the card alone. Once
+/// the bot turns, the card stands at the face plane and copies of it fill the depth behind,
+/// about a device pixel apart: full size on the near half, narrowing like the pillow's
+/// levels on the far half, and darker the farther they sit.
+fn blit_state(ctx: &mut Canvas2D, rig: &Rig, form: &Form, st: &CapState) -> bool {
     let sign = if rig.facing < 0.0 { -1.0 } else { 1.0 };
-    let back = slice_affine(rig, -sign * rig.half_depth);
-    let bounds = st.card_box;
-    let card = st.card.as_ref().expect("card");
-    let shift = (back[4] - front[4]).hypot(back[5] - front[5]);
-    let rim = if shift >= 0.4 {
-        Some((back, 0.62))
+    let rel = relief_for(form, CARD_LEVELS, rig.round);
+    let top = if rel.top > 0.0 {
+        rel.top
     } else {
-        None
+        rig.half_depth
     };
-    blit_cards(&mut ctx.pixmap, card, bounds, front, rim);
+    // The face sits at 0.55 of the pillow's height; the card stands just in front of it.
+    let near = CARD_FRONT * top;
+    let back = CARD_BACK * top;
+    let front = slice_affine(rig, sign * near);
+    let far = slice_affine(rig, -sign * back);
+    let card = st.card.as_ref().expect("card");
+    let shift = (far[4] - front[4]).hypot(far[5] - front[5]);
+    let mut layers = Vec::new();
+    if shift >= 0.4 {
+        let count = (shift / CARD_STEP).ceil().clamp(1.0, CARD_LAYERS_MAX) as usize;
+        for j in 1..=count {
+            let f = j as f64 / count as f64;
+            // From the face plane (f = 0) through the outline to the pillow's far side.
+            let z = near - f * (near + back);
+            let (scale, cx, cy) = if z >= 0.0 {
+                (1.0, 50.0, 50.0)
+            } else {
+                level_at(&rel, -z)
+            };
+            let m = scaled_about(slice_affine(rig, sign * z), scale, cx, cy);
+            let gain = CARD_FAR_GAIN + (CARD_NEAR_GAIN - CARD_FAR_GAIN) * (1.0 - f).powf(1.5);
+            layers.push((m, gain));
+        }
+    }
+    blit_cards(&mut ctx.pixmap, card, front, &layers);
     true
+}
+
+/// Relief levels read for the depth profile behind the card.
+const CARD_LEVELS: u32 = 14;
+/// The card's plane, as a share of the pillow's height: in front of the face (0.55).
+const CARD_FRONT: f64 = 0.6;
+/// How deep the far side goes, as a share of the pillow's height; past it the levels are
+/// too small to read as body.
+const CARD_BACK: f64 = 0.8;
+/// Device pixels between two depth copies.
+const CARD_STEP: f64 = 1.6;
+const CARD_LAYERS_MAX: f64 = 24.0;
+/// Shade of the depth copy just behind the card, and of the farthest one.
+const CARD_NEAR_GAIN: f64 = 0.92;
+const CARD_FAR_GAIN: f64 = 0.62;
+
+/// The pillow level at `depth` from the centre plane: its scale and centre, interpolated.
+fn level_at(rel: &Relief, depth: f64) -> (f64, f64, f64) {
+    let n = rel
+        .z
+        .len()
+        .min(rel.scale.len())
+        .min(rel.cx.len())
+        .min(rel.cy.len());
+    if n == 0 {
+        return (1.0, 50.0, 50.0);
+    }
+    let at = |k: usize| (rel.scale[k] as f64, rel.cx[k] as f64, rel.cy[k] as f64);
+    for k in 1..n {
+        let (z0, z1) = (rel.z[k - 1] as f64, rel.z[k] as f64);
+        if depth <= z1 {
+            let t = if z1 > z0 {
+                ((depth - z0) / (z1 - z0)).clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+            let (a, b) = (at(k - 1), at(k));
+            return (
+                a.0 + (b.0 - a.0) * t,
+                a.1 + (b.1 - a.1) * t,
+                a.2 + (b.2 - a.2) * t,
+            );
+        }
+    }
+    at(n - 1)
+}
+
+/// `m` after scaling design space by `s` about `(cx, cy)`.
+fn scaled_about(m: [f64; 6], s: f64, cx: f64, cy: f64) -> [f64; 6] {
+    let (ox, oy) = ((1.0 - s) * cx, (1.0 - s) * cy);
+    [
+        m[0] * s,
+        m[1] * s,
+        m[2] * s,
+        m[3] * s,
+        m[0] * ox + m[2] * oy + m[4],
+        m[1] * ox + m[3] * oy + m[5],
+    ]
 }
 
 /// The front view as the slice painter draws it, on a card laid out like the fur films
