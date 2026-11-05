@@ -2283,7 +2283,7 @@ fn over_premul(dst: &mut [u8], src: [u32; 4]) {
 /// nearest first) under it, each the card's shape in the `side` colour. One walk: each pixel
 /// takes the front, then the layers behind it until it is opaque, and lays the stack over
 /// what is there.
-fn blit_cards(dst: &mut Pixmap, baked: &BakedCard, front: [f64; 6], layers: &[Layer]) {
+fn blit_cards(dst: &mut Pixmap, baked: &BakedCard, front: [f64; 6], layers: &[Layer], rim: f64) {
     let card = &baked.pixmap;
     let bounds = baked.bbox;
     let side = baked.side;
@@ -2316,6 +2316,33 @@ fn blit_cards(dst: &mut Pixmap, baked: &BakedCard, front: [f64; 6], layers: &[La
             y1 = y1.max(by1);
         }
     }
+    // The rim shadow reads the face's alpha a little toward the side: past the edge there,
+    // the face darkens. The side lies where the deepest layer reads what the face reads.
+    let (rim_dx, rim_dy, rim_k) = match unders.last() {
+        Some((deep, _, _)) if rim > 0.0 => {
+            let (px, py) = ((x0 + x1) as f32 * 0.5, (y0 + y1) as f32 * 0.5);
+            let at = |m: &CardMap| {
+                (
+                    m.fx0 + m.fx_dy * py + m.fx_dx * px,
+                    m.fy0 + m.fy_dy * py + m.fy_dx * px,
+                )
+            };
+            let ((ax, ay), (bx, by)) = (at(&front_m), at(deep));
+            let (dx, dy) = (ax - bx, ay - by);
+            let len = dx.hypot(dy);
+            if len > 1e-3 {
+                let reach = CARD_RIM_WIDTH * sw_i as f32 / len;
+                (
+                    dx * reach,
+                    dy * reach,
+                    (rim.clamp(0.0, 1.0) * 255.0).round() as u32,
+                )
+            } else {
+                (0.0, 0.0, 0)
+            }
+        }
+        _ => (0.0, 0.0, 0),
+    };
     let src = card.data();
     let stride = sw_i as usize * 4;
     let out = dst.data_mut();
@@ -2344,7 +2371,15 @@ fn blit_cards(dst: &mut Pixmap, baked: &BakedCard, front: [f64; 6], layers: &[La
         let ((front_lo, front_hi), (solid_lo, solid_hi)) = layer_spans(&front_m, yf, baked, x0, x1);
         for x in x0..x1 {
             if x >= front_lo && x <= front_hi {
-                stack[(x - x0) as usize] = sample_card(src, stride, sw_i, sh_i, fx, fy);
+                let mut texel = sample_card(src, stride, sw_i, sh_i, fx, fy);
+                if rim_k > 0 && texel[3] > 0 {
+                    let beyond = sample_card(src, stride, sw_i, sh_i, fx + rim_dx, fy + rim_dy);
+                    let dark = rim_k * (255 - beyond[3].min(255)) / 255;
+                    for ch in &mut texel[..3] {
+                        *ch = *ch * (255 - dark) / 255;
+                    }
+                }
+                stack[(x - x0) as usize] = texel;
             }
             fx += front_m.fx_dx;
             fy += front_m.fy_dx;
@@ -2598,12 +2633,25 @@ fn blit_state(ctx: &mut Canvas2D, rig: &Rig, form: &Form, st: &CapState) -> bool
     // The face sits at 0.55 of the pillow's height; the card stands just in front of it.
     let near = CARD_FRONT * top;
     let back = CARD_BACK * top;
-    let mut front = slice_affine(rig, sign * near);
-    let far = slice_affine(rig, -sign * back);
     let card = st.card.as_ref().expect("card");
-    let shift = (far[4] - front[4]).hypot(far[5] - front[5]);
+    // Glued: the body is only as deep as a share of the card's width, however far it turns,
+    // so the back never pulls away from the front and a few layers fill the side.
+    let full = {
+        let (a, b) = (
+            slice_affine(rig, sign * near),
+            slice_affine(rig, -sign * back),
+        );
+        (b[4] - a[4]).hypot(b[5] - a[5])
+    };
+    let most = CARD_GLUE * card.pixmap.width() as f64;
+    let glue = if full > most { most / full } else { 1.0 };
+    let mut front = slice_affine(rig, sign * near * glue);
+    let shift = full * glue;
     let mut layers = Vec::new();
+    // The shadow where the face meets the side, as dark as the side is deep.
+    let mut rim = 0.0;
     if shift >= 0.4 {
+        rim = CARD_RIM_SHADOW * (shift / most.max(1e-6)).min(1.0);
         // The rounded edge: as the bot turns, the face draws in a little across the turn
         // (its width for a yaw, its height for a pitch), and the depth swells back out to
         // the outline along the pillow's own curve, the one the face is painted with, so
@@ -2645,17 +2693,23 @@ fn blit_state(ctx: &mut Canvas2D, rig: &Rig, form: &Form, st: &CapState) -> bool
                 let (scale, cx, cy) = level_at(&rel, -z);
                 (scale, scale, cx, cy)
             };
-            let m = scaled_about(slice_affine(rig, sign * z), scale_x, scale_y, cx, cy);
+            let m = scaled_about(slice_affine(rig, sign * z * glue), scale_x, scale_y, cx, cy);
             let gain = CARD_FAR_GAIN + (CARD_NEAR_GAIN - CARD_FAR_GAIN) * (1.0 - f).powf(1.5);
             // The face's own texture carries over the curve, then gives way to the side.
             let texture = (1.0 - f / CARD_TEXTURE_DEPTH).clamp(0.0, 1.0);
             layers.push(Layer { m, gain, texture });
         }
     }
-    blit_cards(&mut ctx.pixmap, card, front, &layers);
+    blit_cards(&mut ctx.pixmap, card, front, &layers, rim);
     true
 }
 
+/// The deepest the body draws, as a share of the card's width.
+const CARD_GLUE: f64 = 0.035;
+/// How dark the face's edge gets where it meets the side, at full depth.
+const CARD_RIM_SHADOW: f64 = 0.45;
+/// How far in from the face's edge that shadow reaches, as a share of the card's width.
+const CARD_RIM_WIDTH: f32 = 0.04;
 /// Relief levels read for the depth profile behind the card.
 const CARD_LEVELS: u32 = 14;
 /// The card's plane, as a share of the pillow's height: in front of the face (0.55).
